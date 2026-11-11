@@ -1,7 +1,26 @@
-#======== Virtual Environment ========#
+# Virtual Environment 
 .venv
+venv/
+env/
+ENV/
 
+# Python
+__pycache__/
+*.pyc
 
-#======== 3D Files ========#
+# 3D Files 
 /data
 .stl
+
+# VScode 
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Open3D outputs 
+*.npy
