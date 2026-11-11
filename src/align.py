@@ -1,18 +1,8 @@
 """
-Phase 1 - Step 2: Detect attachments on aligned T1 (curvature + DBSCAN, seeded).
-
-Steps:
-  1. Pick one point on the center of each attachment.
-  2. Compute protrusion (distance from a Taubin-smoothed surface) per vertex.
-  3. Keep high-protrusion vertices as candidates.
-  4. Cluster candidates with DBSCAN.
-  5. Keep only clusters that contain a vertex near one of the seeds.
-
-Input : data/processed/<sample>/T1_aligned.stl
-Output: data/processed/<sample>/T1_segmented.ply  (attachments red, rest gray)
+Phase 1 - Step 1: Align T1 to T2 with point-to-plane ICP.
 
 Usage:
-    python src/detect_attachments.py --sample 1
+    python src/align.py --sample 1
 """
 
 import argparse
@@ -20,140 +10,206 @@ from pathlib import Path
 
 import numpy as np
 import open3d as o3d
-from sklearn.cluster import DBSCAN
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
+DATA_DIR = PROJECT_ROOT / "data"
+PROCESSED_DIR = DATA_DIR / "processed"
 
-SMOOTH_ITERATIONS = 50       # Taubin iterations for the base surface
-CURVATURE_PERCENTILE = 90    # vertices above this protrusion percentile are candidates
-DBSCAN_EPS_FACTOR = 0.01     # DBSCAN eps as a fraction of the model diagonal
-DBSCAN_MIN_SAMPLES = 15      # minimum neighbours for a DBSCAN core point
-# cluster must touch this radius around a seed (fraction of diagonal)
-SEED_RADIUS_FACTOR = 0.05
-MIN_CLUSTER_POINTS = 100
-MAX_CLUSTER_POINTS = 30000
+MIN_PAIRS = 4
+SAMPLE_POINTS = 100_000
+# coarse ICP max correspondence distance (x model diagonal)
+COARSE_FACTOR = 0.05
+# fine ICP max correspondence distance (x model diagonal)
+FINE_FACTOR = 0.02
+PICK_RMSE_WARN = 0.02  # warn if picked-point RMSE exceeds this (x diagonal)
+FITNESS_WARN = 0.3     # warn if final fitness is below this
 
 
 def diagonal(mesh):
     return float(np.linalg.norm(mesh.get_axis_aligned_bounding_box().get_extent()))
 
 
-def pick_seeds(mesh):
-    """Pick one point on each attachment center. Returns vertex indices."""
+def load_mesh(path):
+    mesh = o3d.io.read_triangle_mesh(str(path))
+    if not mesh.has_vertices():
+        raise ValueError(f"Could not load mesh: {path}")
+    mesh.compute_vertex_normals()
+    return mesh
+
+
+def show_picks(mesh, points, title):
+    """Show the mesh in gray with picked points as red spheres, for visual check."""
+    radius = max(diagonal(mesh) * 0.012, 1e-6)
+    mesh_gray = o3d.geometry.TriangleMesh(mesh)
+    mesh_gray.paint_uniform_color([0.7, 0.7, 0.7])
+    geometries = [mesh_gray]
+    for p in points:
+        sphere = o3d.geometry.TriangleMesh.create_sphere(radius=radius)
+        sphere.translate(p)
+        sphere.paint_uniform_color([1.0, 0.0, 0.0])
+        sphere.compute_vertex_normals()
+        geometries.append(sphere)
+    o3d.visualization.draw_geometries(
+        geometries, window_name=f"{title} - check picks", width=1024, height=768)
+
+
+def pick_points(mesh, title):
+    """
+    Pick points on mesh vertices. Returns an (N, 3) array.
+
+    Controls:
+        Shift + Left Click  : add a point
+        Shift + Right Click : remove the last point
+        Q / Esc             : finish picking
+    """
     pcd = o3d.geometry.PointCloud()
     pcd.points = mesh.vertices
+    pcd.normals = mesh.vertex_normals
     pcd.paint_uniform_color([0.7, 0.7, 0.7])
+    vertices = np.asarray(pcd.points)
 
     while True:
         vis = o3d.visualization.VisualizerWithEditing()
-        vis.create_window(window_name="Pick attachment centers",
-                          width=1024, height=768)
+        vis.create_window(window_name=title, width=1024, height=768)
         vis.add_geometry(pcd)
         vis.get_render_option().point_size = 2.0
 
-        print("\n[Pick attachment centers]")
-        print("  Shift + Left Click  : add a seed (one per attachment)")
-        print("  Shift + Right Click : remove the last seed")
-        print("  Q / Esc             : finish")
+        print(f"\n[{title}]")
+        print("  Shift + Left Click  : add a point")
+        print("  Shift + Right Click : remove the last point")
+        print("  Q / Esc             : finish picking")
+        print(f"  Pick at least {MIN_PAIRS} points, spread across the arch.")
 
         vis.run()
         indices = vis.get_picked_points()
         vis.destroy_window()
 
-        if indices:
-            print(f"[+] {len(indices)} seed(s) picked.")
-            return np.asarray(indices, dtype=int)
-        print("[!] No seeds picked. Starting over.")
+        if len(indices) >= MIN_PAIRS:
+            points = vertices[indices].astype(float)
+            print(f"[+] {len(points)} points picked:")
+            for i, p in enumerate(points, 1):
+                print(f"    {i}: {np.round(p, 3)}")
+            return points
+
+        print(
+            f"[!] Only {len(indices)} point(s) picked, need at least {MIN_PAIRS}. Starting over.")
 
 
-def protrusion(mesh):
-    """Distance of each vertex from a Taubin-smoothed copy of the surface."""
-    smooth = o3d.geometry.TriangleMesh(mesh).filter_smooth_taubin(
-        number_of_iterations=SMOOTH_ITERATIONS
+def kabsch(src, dst):
+    """Rigid 4x4 transform mapping src[i] -> dst[i] (least squares, no scale)."""
+    if np.linalg.matrix_rank(src - src.mean(axis=0)) < 3:
+        raise ValueError(
+            "Picked points are collinear or coplanar. Spread them across the arch.")
+
+    sc, dc = src.mean(axis=0), dst.mean(axis=0)
+    H = (src - sc).T @ (dst - dc)
+    U, _, Vt = np.linalg.svd(H)
+    d = np.sign(np.linalg.det(Vt.T @ U.T))
+    R = Vt.T @ np.diag([1.0, 1.0, d]) @ U.T
+    T = np.eye(4)
+    T[:3, :3] = R
+    T[:3, 3] = dc - R @ sc
+    return T
+
+
+def sample_with_normals(mesh, scale):
+    """
+    Sample points from the mesh and compute normals from the local point
+    neighbourhood, then orient them consistently and outward from the centre.
+    Mesh triangle winding in STL files is not reliable, so it is not used.
+    """
+    pcd = mesh.sample_points_uniformly(number_of_points=SAMPLE_POINTS)
+    pcd.estimate_normals(
+        search_param=o3d.geometry.KDTreeSearchParamHybrid(
+            radius=0.01 * scale, max_nn=30)
     )
-    return np.linalg.norm(np.asarray(mesh.vertices) - np.asarray(smooth.vertices), axis=1)
+    pcd.orient_normals_consistent_tangent_plane(30)
+
+    pts = np.asarray(pcd.points)
+    nrm = np.asarray(pcd.normals)
+    center = pts.mean(axis=0)
+    if np.mean(np.sum((pts - center) * nrm, axis=1)) < 0:
+        pcd.normals = o3d.utility.Vector3dVector(-nrm)
+    return pcd
 
 
 def main(sample_id):
-    in_path = PROCESSED_DIR / sample_id / "T1_aligned.stl"
-    if not in_path.exists():
-        raise FileNotFoundError(f"Run align.py first. Missing: {in_path}")
+    sample_dir = DATA_DIR / sample_id
+    t1 = load_mesh(sample_dir / "T1.stl")
+    t2 = load_mesh(sample_dir / "T2.stl")
+    scale = max(diagonal(t1), diagonal(t2))
+    print(f"Model diagonal (scale): {scale:.4f}")
 
-    mesh = o3d.io.read_triangle_mesh(str(in_path))
-    mesh.remove_duplicated_vertices()
-    mesh.compute_vertex_normals()
+    # 1. Pick corresponding points, in the same order on both meshes
+    p1 = pick_points(t1, "T1 - pick points WITHOUT attachments")
+    p2 = pick_points(t2, "T2 - pick the SAME points in the SAME order")
+    if len(p1) != len(p2):
+        raise RuntimeError(
+            f"Point counts differ: T1={len(p1)}, T2={len(p2)}. Run again.")
 
-    V = np.asarray(mesh.vertices)
-    scale = diagonal(mesh)
-    print(f"Vertices: {len(V)}, diagonal: {scale:.4f}")
-
-    # 1. Seeds
-    seeds = pick_seeds(mesh)
-
-    # 2. Protrusion and candidates
-    disp = protrusion(mesh)
-    threshold = np.percentile(disp, CURVATURE_PERCENTILE)
-    candidate_idx = np.where(disp >= threshold)[0]
+    # 2. Initial alignment from picked pairs
+    T_init = kabsch(p1, p2)
+    residual = np.linalg.norm(
+        (p1 @ T_init[:3, :3].T + T_init[:3, 3]) - p2, axis=1)
+    pick_rmse = float(np.sqrt(np.mean(residual ** 2)))
     print(
-        f"Candidates above {CURVATURE_PERCENTILE}th percentile: {len(candidate_idx)}")
-
-    # 3. DBSCAN on candidate positions
-    labels = DBSCAN(
-        eps=DBSCAN_EPS_FACTOR * scale,
-        min_samples=DBSCAN_MIN_SAMPLES,
-    ).fit_predict(V[candidate_idx])
-
-    # 4. Keep clusters that touch a seed
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(V)
-    tree = o3d.geometry.KDTreeFlann(pcd)
-    radius = SEED_RADIUS_FACTOR * scale
-
-    seed_near = np.zeros(len(V), dtype=bool)
-    for s in seeds:
-        _, idx, _ = tree.search_radius_vector_3d(V[s], radius)
-        seed_near[np.asarray(idx, dtype=int)] = True
-
-    attach = np.zeros(len(V), dtype=bool)
-    print("\nClusters:")
-    for label in sorted(set(labels) - {-1}):
-        members = candidate_idx[labels == label]
-        size = len(members)
-        touches_seed = seed_near[members].any()
-        ok = touches_seed and MIN_CLUSTER_POINTS <= size <= MAX_CLUSTER_POINTS
-        status = "KEEP" if ok else "skip"
-        centroid = np.round(V[members].mean(axis=0), 2)
+        f"\nInitial alignment RMSE on picks: {pick_rmse:.4f} ({pick_rmse / scale * 100:.2f}% of diagonal)")
+    if pick_rmse / scale > PICK_RMSE_WARN:
         print(
-            f"  [{status}] cluster {label}: {size} vertices, seed nearby: {touches_seed}, centroid {centroid}")
-        if ok:
-            attach[members] = True
+            "[!] Picks disagree more than expected. The same physical points may not match.")
 
-    # Seeds themselves are always part of their attachment
-    attach[seeds] = True
+    # 3. Point-to-plane ICP in two stages: coarse, then fine
+    src = sample_with_normals(t1, scale)
+    dst = sample_with_normals(t2, scale)
+    criteria = o3d.pipelines.registration.ICPConvergenceCriteria(
+        relative_fitness=1e-6, relative_rmse=1e-6, max_iteration=100
+    )
+    p2plane = o3d.pipelines.registration.TransformationEstimationPointToPlane()
+
+    print("\n[1/2] Coarse ICP ...")
+    coarse = o3d.pipelines.registration.registration_icp(
+        src, dst, COARSE_FACTOR * scale, T_init, p2plane, criteria
+    )
+
+    print("[2/2] Fine ICP ...")
+    fine = o3d.pipelines.registration.registration_icp(
+        src, dst, FINE_FACTOR * scale, coarse.transformation, p2plane, criteria
+    )
+
+    fitness = fine.fitness
+    rmse = fine.inlier_rmse
+    print("\n" + "=" * 50)
     print(
-        f"\nAttachment vertices: {attach.sum()} ({attach.sum() / len(V) * 100:.2f}% of mesh)")
+        f"fitness     : {fitness:.4f}   (fraction of points within {FINE_FACTOR} x diagonal)")
+    print(f"inlier_rmse : {rmse:.6f}  ({rmse / scale * 100:.3f}% of diagonal)")
+    if fitness < FITNESS_WARN:
+        print("[!] Low fitness. The alignment may be wrong. Re-check the picks.")
+    print("=" * 50)
 
-    # 5. Color and save
-    colors = np.tile([0.7, 0.7, 0.7], (len(V), 1))
-    colors[attach] = [1.0, 0.0, 0.0]
-    mesh.vertex_colors = o3d.utility.Vector3dVector(colors)
-
+    # 4. Save
     out_dir = PROCESSED_DIR / sample_id
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / "T1_segmented.ply"
-    o3d.io.write_triangle_mesh(str(out_path), mesh)
-    print(f"Saved to {out_path}")
+    np.save(out_dir / "T1_to_T2.npy", fine.transformation)
 
+    t1_aligned = o3d.geometry.TriangleMesh(t1)
+    t1_aligned.transform(fine.transformation)
+    o3d.io.write_triangle_mesh(str(out_dir / "T1_aligned.stl"), t1_aligned)
+    print(f"Saved to {out_dir}")
+
+    # 5. Preview: T1 orange, T2 blue
+    preview_t1 = o3d.geometry.TriangleMesh(t1_aligned)
+    preview_t2 = o3d.geometry.TriangleMesh(t2)
+    preview_t1.paint_uniform_color([1.0, 0.706, 0.0])
+    preview_t2.paint_uniform_color([0.0, 0.651, 0.929])
     o3d.visualization.draw_geometries(
-        [mesh], window_name="T1 segmented (red = attachments)", width=1024, height=768
+        [preview_t1, preview_t2], window_name="T1 (orange) vs T2 (blue)", width=1024, height=768
     )
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Detect attachments on aligned T1.")
+        description="Align T1 to T2 with point-to-plane ICP.")
     parser.add_argument("--sample", required=True,
                         help="Sample folder name, e.g. 1")
     args = parser.parse_args()
