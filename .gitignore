@@ -1,0 +1,7 @@
+#======== Virtual Environment ========#
+.venv
+
+
+#======== 3D Files ========#
+/data
+.stl
