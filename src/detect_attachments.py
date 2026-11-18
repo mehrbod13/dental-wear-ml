@@ -1,5 +1,5 @@
 """
-Phase 1 - Step 2 (version 4.2): automatic attachment detection on T1.
+Phase 1 - Step 2 (version 4.3): automatic attachment detection on T1.
 
 Idea: an attachment is a bump above the tooth surface. The tooth surface under it is
 estimated from a RING AROUND the point (never from the attachment itself).
@@ -15,7 +15,9 @@ Stage 1 (seeds, coarse, uniform 0.3 mm working points):
 Stage 2 (boundary, native mesh resolution):
   per cluster (largest seed area first), fit the base surface to a thin ring just outside
   the current region (wall points removed by a normal filter), grow the region to vertices
-  with h >= EDGE_HEIGHT, repeat a few times. Attachment = final region.
+  with h >= EDGE_HEIGHT, repeat a few times.
+  Cleanup: drop vertices below EDGE_REL x h95 (low bulges of neighbouring teeth) and keep
+  only the largest connected piece on the mesh. Attachment = what remains.
   Two attachments closer than MIN_SEPARATION are treated as duplicates (one per tooth).
   Attachments whose ring fit is poor or whose region is unusually large get
   qc_flag = "check" (base surface probably biased; measure them separately).
@@ -44,6 +46,8 @@ from pathlib import Path
 
 import numpy as np
 import open3d as o3d
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
 from scipy.spatial import cKDTree
 from sklearn.cluster import DBSCAN
 
@@ -53,17 +57,14 @@ DATA_DIR = PROJECT_ROOT / "data"
 PROCESSED_DIR = DATA_DIR / "processed"
 
 # ---- All lengths in millimetres ------------------------------------------------------
-# spacing of the working point set (same for fine/coarse scans)
-VOXEL = 0.3
+VOXEL = 0.3               # spacing of the working point set (same for fine/coarse scans)
 
 # Stage 1: annulus fit
 ANN_IN = 2.0              # annulus inner radius (outside the attachment wall)
 ANN_OUT = 3.5             # annulus outer radius
-# annulus points must have a normal this similar to the centre normal
-ANN_NORMAL_DOT = 0.65
+ANN_NORMAL_DOT = 0.65     # annulus points must have a normal this similar to the centre normal
 ANN_MIN_POINTS = 60
-# of 8 angular sectors that must contain points (no extrapolation)
-ANN_MIN_SECTORS = 5
+ANN_MIN_SECTORS = 5       # of 8 angular sectors that must contain points (no extrapolation)
 ANN_MAX_RMS = 0.15        # residual rms of the annulus fit; larger = not a clean surface
 SEED_HEIGHT = 0.5         # seed if this far above the annulus surface
 BORDER_MARGIN = 1.0       # ignore points closer than this to the scan border
@@ -71,10 +72,10 @@ BUCCAL_DOT = 0.35         # min. alignment of normal with the outward arch direc
 DBSCAN_EPS = 0.7          # (at least 2.2 x voxel)
 DBSCAN_MIN_SAMPLES = 5
 SEED_MIN_AREA = 0.5       # mm^2, clusters below this are ignored silently
-# mm^2, case 1: true >= 3.35, false <= 1.40; case 2: true >= 2.68, false <= 2.05
-MIN_SEED_AREA = 2.5
-# mm, neighbouring teeth are about 6-7 mm apart; one attachment per tooth
-MIN_SEPARATION = 4.0
+# mm^2. true: case 1 >= 3.35, case 2 >= 2.68, case 12 >= 2.48; false: case 1 <= 1.40, case 2 <= 2.05
+MIN_SEED_AREA = 2.3
+# mm. smallest true spacing seen in cases 1, 2, 12 is about 7.0; false duplicate in case 12 was 5.0
+MIN_SEPARATION = 5.5
 
 # Stage 2: ring fit and region growing (native mesh vertices)
 PATCH_RADIUS = 6.0        # vertices around the cluster centre that are considered
@@ -83,16 +84,17 @@ RING_IN = 0.4             # thin ring just outside the region
 RING_OUT = 1.6
 RING_NORMAL_DOT = 0.8     # removes the steep wall from the ring
 EDGE_HEIGHT = 0.25        # region = vertices at least this far above the base surface
+EDGE_REL = 0.3            # cleanup: also at least this fraction of the region's h95
 GROW_STEP = 1.0           # region can grow by at most this per iteration
 MAX_EXTENT = 3.0          # region stays within this distance of the cluster centre
 REFINE_ITERS = 4
+MIN_REGION_VERTICES = 20
 
 # Final acceptance
 MIN_AREA = 2.0            # mm^2 (footprint)
 MAX_AREA = 25.0
 MIN_TOP_H = 0.5           # mm, 95th percentile of h inside the region
-# true: case 1 0.77-1.05, case 2 1.07-1.77; wrong base surface: >= 2.7
-MAX_TOP_H = 2.2
+MAX_TOP_H = 2.5           # true: case 1 0.77-1.05, case 2 1.07-1.77, case 12 1.26-2.23; wrong base: >= 2.7
 
 # QC flag (not a rejection): base surface probably biased
 QC_MAX_RING_RMS = 0.10    # mm; kept attachments in cases 1, 2 were 0.025-0.088
@@ -128,6 +130,24 @@ def border_vertices(faces, n):
     return mask
 
 
+def largest_component(idx, h, edges, areas, n):
+    """
+    Boolean mask over idx: the mesh-connected piece (through mesh edges) with the largest
+    volume (sum of area x h). Removes separate blobs that were grown onto neighbouring teeth.
+    """
+    local = np.full(n, -1, dtype=np.int64)
+    local[idx] = np.arange(len(idx))
+    sel = (local[edges[:, 0]] >= 0) & (local[edges[:, 1]] >= 0)
+    e = local[edges[sel]]
+    m = len(idx)
+    g = coo_matrix((np.ones(len(e)), (e[:, 0], e[:, 1])), shape=(m, m))
+    n_comp, lab = connected_components(g, directed=False)
+    if n_comp == 1:
+        return np.ones(m, dtype=bool)
+    vol = np.bincount(lab, weights=areas[idx] * np.maximum(h, 0), minlength=n_comp)
+    return lab == int(vol.argmax())
+
+
 def arch_geometry(points):
     """Occlusal axis (smallest-variance PCA axis) and arch centre (median)."""
     centre = points.mean(axis=0)
@@ -150,8 +170,7 @@ def flat_dot(normals, radial, occlusal):
 
 
 def tangent_frame(n):
-    helper = np.array([1.0, 0, 0]) if abs(
-        n[0]) < 0.9 else np.array([0, 1.0, 0])
+    helper = np.array([1.0, 0, 0]) if abs(n[0]) < 0.9 else np.array([0, 1.0, 0])
     e1 = np.cross(n, helper)
     e1 /= np.linalg.norm(e1)
     return e1, np.cross(n, e1)
@@ -220,8 +239,7 @@ def annulus_height(pts, nrm, query_idx, a):
         if r > a.max_rms:
             continue
         h[i] = -coef[5]
-        # normal of the base surface at the point
-        b = n - coef[3] * e1 - coef[4] * e2
+        b = n - coef[3] * e1 - coef[4] * e2          # normal of the base surface at the point
         bn[i] = b / np.linalg.norm(b)
         ok[i] = True
     return h, rms, ok, bn
@@ -230,8 +248,7 @@ def annulus_height(pts, nrm, query_idx, a):
 # ---- stage 2 -------------------------------------------------------------------------
 def refine_cluster(points, normals, vtree, centre, n_ref, seed_pts):
     """Ring-based base surface + region growing on native vertices. Returns dict or None."""
-    patch = np.asarray(vtree.query_ball_point(
-        centre, r=PATCH_RADIUS), dtype=np.int64)
+    patch = np.asarray(vtree.query_ball_point(centre, r=PATCH_RADIUS), dtype=np.int64)
     if len(patch) < 100:
         return None
     P, N = points[patch], normals[patch]
@@ -283,8 +300,7 @@ def check_picks(out_dir, a, points, labels, centroids, wtree, h, rms, ok, valid)
         return
     p = np.load(f)
     if p.ndim != 2 or p.shape[1] != 3:
-        print(
-            f"\n[picks] {f.name} is not a (k,3) coordinate array (shape {p.shape}); skipped.")
+        print(f"\n[picks] {f.name} is not a (k,3) coordinate array (shape {p.shape}); skipped.")
         return
     cands = {"as saved": p}
     tf = out_dir / "T1_to_T2.npy"
@@ -299,8 +315,7 @@ def check_picks(out_dir, a, points, labels, centroids, wtree, h, rms, ok, valid)
     atree = cKDTree(points[att])
     name = min(cands, key=lambda k: atree.query(cands[k])[0].sum())
     q = cands[name]
-    print(
-        f"\n[picks] comparing {len(q)} manual picks (frame: {name}); diagnostic only")
+    print(f"\n[picks] comparing {len(q)} manual picks (frame: {name}); diagnostic only")
     found = 0
     for k, pt in enumerate(q):
         d_reg = atree.query(pt)[0]
@@ -310,8 +325,7 @@ def check_picks(out_dir, a, points, labels, centroids, wtree, h, rms, ok, valid)
         print(f"  pick {k}: dist to nearest attachment region {d_reg:5.2f} mm "
               f"-> {'FOUND' if hit else 'MISSED'} | stage-1 at pick: h={h[wi]:.2f} "
               f"rms={rms[wi]:.3f} valid_region={bool(valid[wi])} fit_ok={bool(ok[wi])}")
-    print(
-        f"  picks found: {found}/{len(q)}; detected attachments: {len(centroids)}")
+    print(f"  picks found: {found}/{len(q)}; detected attachments: {len(centroids)}")
 
 
 # ---- main ----------------------------------------------------------------------------
@@ -364,6 +378,7 @@ def main(args):
     nn = idx4[:, 0]
     areas = vertex_areas(points, faces)
     wp_area = np.bincount(nn, weights=areas, minlength=len(dpts))
+    mesh_edges = edges_of(faces)
 
     # 3. Which working points are evaluated
     border = border_vertices(faces, n)
@@ -376,8 +391,7 @@ def main(args):
     print(f"Evaluated (buccal, away from border): {len(query_idx)} points")
 
     # 4. Stage 1
-    print(
-        f"Stage 1: annulus fits ({args.ann_in}-{args.ann_out} mm) ... takes a little while")
+    print(f"Stage 1: annulus fits ({args.ann_in}-{args.ann_out} mm) ... takes a little while")
     h, rms, ok, bn = annulus_height(dpts, dnrm, query_idx, args)
     ok &= valid_region
     print(f"Fits accepted: {ok.sum()} of {len(query_idx)} "
@@ -387,8 +401,7 @@ def main(args):
         pr = np.nanpercentile(rms[query_idx], [10, 50, 90])
         print(f"h (accepted) mm: p1 {p[0]:.3f} | p50 {p[1]:.3f} | p99 {p[2]:.3f} | "
               f"p99.9 {p[3]:.3f} | max {h[ok].max():.3f}")
-        print(
-            f"annulus rms (all evaluated) mm: p10 {pr[0]:.3f} | p50 {pr[1]:.3f} | p90 {pr[2]:.3f}")
+        print(f"annulus rms (all evaluated) mm: p10 {pr[0]:.3f} | p50 {pr[1]:.3f} | p90 {pr[2]:.3f}")
 
     seeds = np.where(ok & (h >= args.seed_height))[0]
     print(f"Seed points (h >= {args.seed_height} mm): {len(seeds)}")
@@ -422,8 +435,7 @@ def main(args):
         centre = dpts[mem].mean(axis=0)
         tag = f"seed_area={seed_area:5.2f} h_seed_max={hmax_seed:.2f} at {np.round(centre, 1)}"
         if seed_area < args.min_seed_area:
-            print(
-                f"  [skip] {tag} | seed area < {args.min_seed_area} (edge effect)")
+            print(f"  [skip] {tag} | seed area < {args.min_seed_area} (edge effect)")
             continue
         n_ref = bn[mem].mean(axis=0)
         n_ref /= np.linalg.norm(n_ref)
@@ -432,6 +444,21 @@ def main(args):
             print(f"  [skip] {tag}: refinement failed (no clean ring)")
             continue
         idx, hh = res["idx"], res["h"]
+
+        # cleanup: relative height cut, then the largest connected piece on the mesh
+        n_before = len(idx)
+        cut = hh >= max(EDGE_HEIGHT, EDGE_REL * float(np.percentile(hh, 95)))
+        idx, hh = idx[cut], hh[cut]
+        if len(idx) < MIN_REGION_VERTICES:
+            print(f"  [skip] {tag}: region vanished after cleanup")
+            continue
+        comp = largest_component(idx, hh, mesh_edges, areas, n)
+        idx, hh = idx[comp], hh[comp]
+        if len(idx) < MIN_REGION_VERTICES:
+            print(f"  [skip] {tag}: region too small after cleanup")
+            continue
+        trim = 100.0 * (1 - len(idx) / n_before)
+
         area = float(areas[idx].sum())
         h95 = float(np.percentile(hh, 95))
         h_top = float(hh[hh >= 0.8 * h95].mean())
@@ -446,33 +473,27 @@ def main(args):
             dmin = np.linalg.norm(kept_c - cen, axis=1)
             j = int(dmin.argmin())
             if dmin[j] < args.min_separation:
-                reasons.append(
-                    f"{dmin[j]:.1f} mm from kept #{j} (< {args.min_separation})")
+                reasons.append(f"{dmin[j]:.1f} mm from kept #{j} (< {args.min_separation})")
         if not (args.min_area <= area <= args.max_area):
-            reasons.append(
-                f"area {area:.1f} outside {args.min_area}-{args.max_area}")
+            reasons.append(f"area {area:.1f} outside {args.min_area}-{args.max_area}")
         if not (MIN_TOP_H <= h95 <= MAX_TOP_H):
             reasons.append(f"h95 {h95:.2f} outside {MIN_TOP_H}-{MAX_TOP_H}")
         info = (f"area={area:5.2f} mm2 h95={h95:.2f} h_top={h_top:.2f} V={vol:4.2f} mm3 "
-                f"ring_rms={res['rms']:.3f} n_ring={res['n_ring']}")
+                f"ring_rms={res['rms']:.3f} n_ring={res['n_ring']} trim={trim:.0f}%")
         if reasons:
             print(f"  [skip] {tag} | {info} | {'; '.join(reasons)}")
             continue
-        qc = "check" if (
-            res["rms"] > QC_MAX_RING_RMS or area > QC_MAX_AREA) else "ok"
+        qc = "check" if (res["rms"] > QC_MAX_RING_RMS or area > QC_MAX_AREA) else "ok"
         k = len(rows)
         labels_out[idx] = k
         rows.append(dict(id=k, cx=cen[0], cy=cen[1], cz=cen[2], area_mm2=area,
-                         h95_mm=h95, h_top_mm=h_top, volume_mm3=vol, n_vertices=len(
-                             idx),
+                         h95_mm=h95, h_top_mm=h_top, volume_mm3=vol, n_vertices=len(idx),
                          ring_rms_mm=res["rms"], nx=n_ref[0], ny=n_ref[1], nz=n_ref[2],
                          qc_flag=qc))
-        print(
-            f"  [KEEP #{k}{' QC=check' if qc == 'check' else ''}] {tag} | {info}")
+        print(f"  [KEEP #{k}{' QC=check' if qc == 'check' else ''}] {tag} | {info}")
     attach = labels_out >= 0
     n_check = sum(r_["qc_flag"] == "check" for r_ in rows)
-    print(
-        f"\nAttachments kept: {len(rows)} (expected up to ~14), flagged 'check': {n_check}")
+    print(f"\nAttachments kept: {len(rows)} (expected up to ~14), flagged 'check': {n_check}")
 
     # 7. Save
     out_dir = PROCESSED_DIR / args.sample
@@ -497,8 +518,7 @@ def main(args):
     dbg[ok[nn] & (dist4[:, 0] <= 1.5 * args.voxel)] = GREEN
     dbg[(lab_seed[nn] >= 0) & (dist4[:, 0] <= 1.5 * args.voxel)] = ORANGE
     dbg[attach] = RED
-    o3d.io.write_triangle_mesh(
-        str(out_dir / "T1_detection_debug.ply"), colored(mesh, dbg))
+    o3d.io.write_triangle_mesh(str(out_dir / "T1_detection_debug.ply"), colored(mesh, dbg))
 
     np.save(out_dir / "T1_attachment_labels.npy", labels_out)
     if rows:
@@ -508,8 +528,7 @@ def main(args):
             wr.writerows(rows)
     print(f"Saved to {out_dir}")
 
-    check_picks(out_dir, args, points, labels_out,
-                rows, wtree, h, rms, ok, valid_region)
+    check_picks(out_dir, args, points, labels_out, rows, wtree, h, rms, ok, valid_region)
 
     if args.show != "none":
         o3d.visualization.draw_geometries(
@@ -520,10 +539,8 @@ def main(args):
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(
-        description="Detect attachments on T1 automatically (v4.2).")
-    ap.add_argument("--sample", required=True,
-                    help="Sample folder name, e.g. 2")
+    ap = argparse.ArgumentParser(description="Detect attachments on T1 automatically (v4.3).")
+    ap.add_argument("--sample", required=True, help="Sample folder name, e.g. 2")
     ap.add_argument("--aligned", action="store_true",
                     help="use T1_aligned.stl instead of the raw T1.stl")
     ap.add_argument("--voxel", type=float, default=VOXEL)
