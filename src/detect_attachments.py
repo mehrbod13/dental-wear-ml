@@ -1,5 +1,5 @@
 """
-Phase 1 - Step 2 : automatic attachment detection on T1.
+Phase 1 - Step 2 : automatic attachment detection on one scan (T1 or T2).
 
 Idea: an attachment is a bump above the tooth surface. The tooth surface under it is
 estimated from a RING AROUND the point (never from the attachment itself).
@@ -15,25 +15,33 @@ Stage 1 (seeds, coarse, uniform 0.3 mm working points):
 Stage 2 (boundary, native mesh resolution):
   per cluster (largest seed area first), fit the base surface to a thin ring just outside
   the current region (wall points removed by a normal filter), grow the region to vertices
-  with h >= EDGE_HEIGHT, repeat a few times.
-  Cleanup: drop vertices below EDGE_REL x h95 (low bulges of neighbouring teeth) and keep
-  only the largest connected piece on the mesh (by surface area). Attachment = what remains.
+  with h >= EDGE_HEIGHT, repeat a few times. The LAST ring fit of this loop is THE base
+  surface of the attachment: every number written by this project (h95, h_top, volume)
+  uses the h of this one fit. Nothing is re-fitted later.
+  Cleanup (selection only, the base surface is not touched): drop vertices below
+  EDGE_REL x h95 (low bulges of neighbouring teeth) and keep only the largest connected
+  piece on the mesh (by surface area). Attachment = what remains.
   Two attachments closer than MIN_SEPARATION are treated as duplicates (one per tooth).
   Attachments whose ring fit is poor or whose region is unusually large get
   qc_flag = "check" (base surface probably biased; measure them separately).
 
-Input : data/<sample>/T1.stl  (default; detection does not need alignment)
-        data/processed/<sample>/T1_aligned.stl with --aligned
+This script does NOT compute volumes. src/measure_volume.py reads the labels, the heights
+and the CSV written here.
+
+Input : data/<sample>/<scan>.stl   (scan = T1 or T2; detection does not need alignment)
 Output: data/processed/<sample>/
-          T1_segmented.ply         gray mesh, attachments red
-          T1_detection_debug.ply   gray = not evaluated, light green = evaluated,
-                                   orange = seeds, red = attachments
-          T1_height_map.ply        stage-1 h (smooth), red = above base, blue = below
-          T1_attachment_labels.npy int32 per vertex of the CLEANED mesh, -1 = background
-          T1_attachments.csv       one row per attachment (coordinates in the input frame)
+          <scan>_segmented.ply         gray mesh, attachments red
+          <scan>_detection_debug.ply   gray = not evaluated, light green = evaluated,
+                                       orange = seeds, red = attachments
+          <scan>_height_map.ply        stage-1 h (smooth), red = above base, blue = below
+          <scan>_attachment_labels.npy int32 per vertex of the CLEANED mesh, -1 = background
+          <scan>_attachment_height.npy float32 per vertex: h above the base surface (mm)
+                                       for attachment vertices, NaN elsewhere
+          <scan>_attachments.csv       one row per attachment (coordinates in the scan frame)
 
 Usage:
     python src/detect_attachments.py --sample 1
+    python src/detect_attachments.py --sample 2 --scan T2
     python src/detect_attachments.py --sample 2 --seed-height 0.4
     python src/detect_attachments.py --sample 2 --max-rms 0.2
     python src/detect_attachments.py --sample 2 --min-seed-area 2.0
@@ -94,7 +102,7 @@ REFINE_ITERS = 4
 MIN_REGION_VERTICES = 20
 
 # Final acceptance
-MIN_AREA = 2.0            # mm^2 (footprint)
+MIN_AREA = 2.0            # mm^2 (footprint, real surface area)
 MAX_AREA = 25.0
 MIN_TOP_H = 0.5           # mm, 95th percentile of h inside the region
 # true: case 1 0.77-1.05, case 2 1.07-1.77, case 12 1.26-2.23; wrong base: >= 2.7
@@ -104,6 +112,8 @@ MAX_TOP_H = 2.5
 QC_MAX_RING_RMS = 0.10    # mm; kept attachments in cases 1, 2 were 0.025-0.088
 QC_MAX_AREA = 16.0        # mm^2; kept attachments in case 2 were 11-15.5
 
+SCANS = ("T1", "T2")
+
 GRAY = [0.72, 0.72, 0.72]
 GREEN = [0.80, 0.93, 0.80]
 RED = [1.0, 0.0, 0.0]
@@ -111,6 +121,18 @@ ORANGE = [1.0, 0.55, 0.0]
 
 
 # ---- helpers -------------------------------------------------------------------------
+def load_mesh(path):
+    """
+    The one place where a scan is read and cleaned. Vertex order of the result is the order
+    of the label / height files, so every script must load meshes through this function.
+    """
+    mesh = o3d.io.read_triangle_mesh(str(path))
+    mesh.remove_duplicated_vertices()
+    mesh.remove_degenerate_triangles()
+    mesh.compute_vertex_normals()
+    return mesh
+
+
 def edges_of(faces):
     return np.concatenate([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]])
 
@@ -253,7 +275,10 @@ def annulus_height(pts, nrm, query_idx, a):
 
 # ---- stage 2 -------------------------------------------------------------------------
 def refine_cluster(points, normals, vtree, centre, n_ref, seed_pts):
-    """Ring-based base surface + region growing on native vertices. Returns dict or None."""
+    """
+    Ring-based base surface + region growing on native vertices. Returns dict or None.
+    The returned h is the height above the LAST ring fit (the base surface of this attachment).
+    """
     patch = np.asarray(vtree.query_ball_point(
         centre, r=PATCH_RADIUS), dtype=np.int64)
     if len(patch) < 100:
@@ -300,8 +325,8 @@ def refine_cluster(points, normals, vtree, centre, n_ref, seed_pts):
     return dict(idx=patch[region], h=h[region], rms=rms, n_ring=n_ring)
 
 
-# ---- validation against the old manual picks (diagnostic only) -----------------------
-def check_picks(out_dir, a, points, labels, centroids, wtree, h, rms, ok, valid):
+# ---- validation against the old manual picks (diagnostic only, T1) -------------------
+def check_picks(out_dir, points, labels, centroids, wtree, h, rms, ok, valid):
     f = out_dir / "picks_T1.npy"
     if not f.exists():
         return
@@ -313,8 +338,7 @@ def check_picks(out_dir, a, points, labels, centroids, wtree, h, rms, ok, valid)
     cands = {"as saved": p}
     tf = out_dir / "T1_to_T2.npy"
     if tf.exists():
-        T = np.load(tf)
-        M = T if a.aligned else np.linalg.inv(T)
+        M = np.linalg.inv(np.load(tf))
         cands["other frame"] = p @ M[:3, :3].T + M[:3, 3]
     att = labels >= 0
     if not att.any():
@@ -346,15 +370,13 @@ def colored(mesh, colors):
 
 
 def main(args):
-    raw = DATA_DIR / args.sample / "T1.stl"
-    aligned = PROCESSED_DIR / args.sample / "T1_aligned.stl"
-    in_path = aligned if args.aligned else raw
+    scan = args.scan
+    in_path = DATA_DIR / args.sample / f"{scan}.stl"
     print(f"Input: {in_path}")
+    if not in_path.exists():
+        raise SystemExit(f"Missing file: {in_path}")
 
-    mesh = o3d.io.read_triangle_mesh(str(in_path))
-    mesh.remove_duplicated_vertices()
-    mesh.remove_degenerate_triangles()
-    mesh.compute_vertex_normals()
+    mesh = load_mesh(in_path)
     points = np.asarray(mesh.vertices)
     faces = np.asarray(mesh.triangles)
     normals = np.asarray(mesh.vertex_normals).copy()
@@ -441,6 +463,7 @@ def main(args):
     print(f"\nSeed clusters: {len(clusters)}")
 
     labels_out = np.full(n, -1, dtype=np.int32)
+    height_out = np.full(n, np.nan, dtype=np.float32)
     rows = []
     print("Clusters (largest seed area first, refined on native vertices):")
     for seed_area, c, mem, hmax_seed in clusters:
@@ -458,7 +481,7 @@ def main(args):
             continue
         idx, hh = res["idx"], res["h"]
 
-        # cleanup: relative height cut, then the largest connected piece on the mesh
+        # cleanup (selection only): relative height cut, then the largest connected piece
         n_before = len(idx)
         cut = hh >= max(EDGE_HEIGHT, EDGE_REL * float(np.percentile(hh, 95)))
         idx, hh = idx[cut], hh[cut]
@@ -501,6 +524,7 @@ def main(args):
             res["rms"] > QC_MAX_RING_RMS or area > QC_MAX_AREA) else "ok"
         k = len(rows)
         labels_out[idx] = k
+        height_out[idx] = hh
         rows.append(dict(id=k, cx=cen[0], cy=cen[1], cz=cen[2], area_mm2=area,
                          h95_mm=h95, h_top_mm=h_top, n_vertices=len(idx),
                          ring_rms_mm=res["rms"], nx=n_ref[0], ny=n_ref[1], nz=n_ref[2],
@@ -524,30 +548,33 @@ def main(args):
     pos, neg = np.clip(x, 0, 1), np.clip(-x, 0, 1)
     heat = np.stack([1 - neg, 1 - pos - neg, 1 - pos], axis=1)
     heat_mesh = colored(mesh, heat)
-    o3d.io.write_triangle_mesh(str(out_dir / "T1_height_map.ply"), heat_mesh)
+    o3d.io.write_triangle_mesh(
+        str(out_dir / f"{scan}_height_map.ply"), heat_mesh)
 
     colors = np.tile(GRAY, (n, 1))
     colors[attach] = RED
     seg = colored(mesh, colors)
-    o3d.io.write_triangle_mesh(str(out_dir / "T1_segmented.ply"), seg)
+    o3d.io.write_triangle_mesh(str(out_dir / f"{scan}_segmented.ply"), seg)
 
     dbg = np.tile(GRAY, (n, 1))
     dbg[ok[nn] & (dist4[:, 0] <= 1.5 * args.voxel)] = GREEN
     dbg[(lab_seed[nn] >= 0) & (dist4[:, 0] <= 1.5 * args.voxel)] = ORANGE
     dbg[attach] = RED
     o3d.io.write_triangle_mesh(
-        str(out_dir / "T1_detection_debug.ply"), colored(mesh, dbg))
+        str(out_dir / f"{scan}_detection_debug.ply"), colored(mesh, dbg))
 
-    np.save(out_dir / "T1_attachment_labels.npy", labels_out)
+    np.save(out_dir / f"{scan}_attachment_labels.npy", labels_out)
+    np.save(out_dir / f"{scan}_attachment_height.npy", height_out)
     if rows:
-        with open(out_dir / "T1_attachments.csv", "w", newline="") as f:
+        with open(out_dir / f"{scan}_attachments.csv", "w", newline="") as f:
             wr = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
             wr.writeheader()
             wr.writerows(rows)
     print(f"Saved to {out_dir}")
 
-    check_picks(out_dir, args, points, labels_out,
-                rows, wtree, h, rms, ok, valid_region)
+    if scan == "T1":
+        check_picks(out_dir, points, labels_out, rows,
+                    wtree, h, rms, ok, valid_region)
 
     if args.show != "none":
         o3d.visualization.draw_geometries(
@@ -559,11 +586,11 @@ def main(args):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(
-        description="Detect attachments on T1 automatically (v4.4).")
+        description="Detect attachments on one scan automatically (v4.5).")
     ap.add_argument("--sample", required=True,
                     help="Sample folder name, e.g. 2")
-    ap.add_argument("--aligned", action="store_true",
-                    help="use T1_aligned.stl instead of the raw T1.stl")
+    ap.add_argument("--scan", choices=SCANS, default="T1",
+                    help="which scan to process")
     ap.add_argument("--voxel", type=float, default=VOXEL)
     ap.add_argument("--ann-in", type=float, default=ANN_IN)
     ap.add_argument("--ann-out", type=float, default=ANN_OUT)
