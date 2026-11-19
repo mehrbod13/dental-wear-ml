@@ -1,3 +1,5 @@
+# src/detect_attachments.py
+
 """
 Phase 1 - Step 2 : automatic attachment detection on one scan (T1 or T2).
 
