@@ -1,5 +1,3 @@
-# src/measure_volume.py
-
 """
 Phase 1 - Step 3a: volume of the detected attachments, for T1 (pre) and T2 (post).
 
@@ -42,7 +40,8 @@ import csv
 
 import numpy as np
 
-from detect_attachments import DATA_DIR, PROCESSED_DIR, PROJECT_ROOT, load_mesh
+from config import DATA_DIR, PROCESSED_DIR, PROJECT_ROOT
+from detect_attachments import load_mesh
 
 # (file prefix, label in the csv header)
 SCANS = (("T1", "pre"), ("T2", "post"))

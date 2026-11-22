@@ -11,7 +11,7 @@ from collections import defaultdict
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Border, Font, Side
 
-from detect_attachments import DATA_DIR, PROCESSED_DIR
+from config import DATA_DIR, PROCESSED_DIR
 
 # Read from the picture, so CHECK spelling. Add groups 7 and 9 if you have them.
 TITLES = {
@@ -95,14 +95,16 @@ def load_manual():
                            ari=get(r, "ari"), failure_mode=fm or None)
     for s, c in count.items():
         if c != N_TEETH:
-            print(f"[WARNING] manual table: sample {s} has {c} rows, expected {N_TEETH}")
+            print(
+                f"[WARNING] manual table: sample {s} has {c} rows, expected {N_TEETH}")
     return out
 
 
 def main(args):
     manual = load_manual()
     if not manual:
-        print("[INFO] no manual_all file: defect/excess/RMS/SBS/ARI/failure mode stay empty")
+        print(
+            "[INFO] no manual_all file: defect/excess/RMS/SBS/ARI/failure mode stay empty")
 
     wb = Workbook()
     ws = wb.active
@@ -113,10 +115,13 @@ def main(args):
         vols = {int(v["tooth"]): v
                 for v in read_csv(PROCESSED_DIR / s / "volumes_matched.csv")}
         if not vols:
-            print(f"[WARNING] sample {s}: no volumes_matched.csv -> volume columns empty")
+            print(
+                f"[WARNING] sample {s}: no volumes_matched.csv -> volume columns empty")
 
-        ws.cell(r, 1, f"گروه {s.translate(FA)}: {TITLES.get(s, '')}").font = Font(bold=True, size=12)
-        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=len(HEADERS))
+        ws.cell(r, 1, f"گروه {s.translate(FA)}: {TITLES.get(s, '')}").font = Font(
+            bold=True, size=12)
+        ws.merge_cells(start_row=r, start_column=1,
+                       end_row=r, end_column=len(HEADERS))
         ws.cell(r, 1).alignment = Alignment(horizontal="left")
         r += 1
         for c, h in enumerate(HEADERS, start=1):
@@ -133,7 +138,8 @@ def main(args):
             ws.cell(r, 4, num(m.get("rms")))
             ws.cell(r, 5, num(v.get("pre_volume_mm3")))
             ws.cell(r, 6, num(v.get("post_volume_mm3")))
-            ws.cell(r, 7, f'=IF(AND(ISNUMBER(E{r}),ISNUMBER(F{r})),E{r}-F{r},"")')
+            ws.cell(
+                r, 7, f'=IF(AND(ISNUMBER(E{r}),ISNUMBER(F{r})),E{r}-F{r},"")')
             ws.cell(r, 8, f'=IF(AND(ISNUMBER(G{r}),E{r}>0),G{r}/E{r},"")')
             ws.cell(r, 9, num(m.get("sbs")))
             ws.cell(r, 10, num(m.get("ari")))
@@ -153,7 +159,8 @@ def main(args):
 
         for row in ws.iter_rows(min_row=hdr, max_row=r, max_col=len(HEADERS)):
             for cell in row:
-                cell.border = Border(top=thin, bottom=thin, left=thin, right=thin)
+                cell.border = Border(top=thin, bottom=thin,
+                                     left=thin, right=thin)
                 cell.alignment = Alignment(horizontal="center")
         r += 2
 

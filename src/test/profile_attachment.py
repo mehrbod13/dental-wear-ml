@@ -23,6 +23,7 @@ Usage:
     python src/profile_attachment.py --sample 4 --file T1.stl --slab 0.2 --grid 0.3
 """
 
+from ..config import PROCESSED_DIR, DATA_DIR
 import argparse
 from pathlib import Path
 
@@ -32,11 +33,6 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import open3d as o3d  # noqa: E402
 from scipy.spatial import cKDTree  # noqa: E402
-
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = PROJECT_ROOT / "data"
-PROCESSED_DIR = DATA_DIR / "processed"
 
 # All lengths in millimetres
 VIEW_RADIUS = 8.0      # half-size of the window around the picked point

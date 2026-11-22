@@ -18,6 +18,8 @@ Usage:
     python src/profile_compare.py --sample 1
 """
 
+from test.profile_attachment import occlusal_axis, local_frame
+from ..config import DATA_DIR, PROCESSED_DIR
 import argparse
 
 import matplotlib
@@ -27,8 +29,6 @@ import numpy as np  # noqa: E402
 import open3d as o3d  # noqa: E402
 from scipy.spatial import cKDTree  # noqa: E402
 
-from profile_attachment import (DATA_DIR, PROCESSED_DIR,  # noqa: E402
-                                occlusal_axis, local_frame)
 
 VIEW_RADIUS = 6.0
 SLAB_HALF = 0.12

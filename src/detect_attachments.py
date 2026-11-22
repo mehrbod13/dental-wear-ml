@@ -1,5 +1,3 @@
-# src/detect_attachments.py
-
 """
 Phase 1 - Step 2 : automatic attachment detection on one scan (T1 or T2).
 
@@ -52,7 +50,6 @@ Usage:
 
 import argparse
 import csv
-from pathlib import Path
 
 import numpy as np
 import open3d as o3d
@@ -61,10 +58,8 @@ from scipy.sparse.csgraph import connected_components
 from scipy.spatial import cKDTree
 from sklearn.cluster import DBSCAN
 
+from config import DATA_DIR, PROCESSED_DIR
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = PROJECT_ROOT / "data"
-PROCESSED_DIR = DATA_DIR / "processed"
 
 # ---- All lengths in millimetres ------------------------------------------------------
 # spacing of the working point set (same for fine/coarse scans)
