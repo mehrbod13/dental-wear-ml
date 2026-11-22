@@ -24,6 +24,11 @@ Stage 2 (boundary, native mesh resolution):
   Two attachments closer than MIN_SEPARATION are treated as duplicates (one per tooth).
   Attachments whose ring fit is poor or whose region is unusually large get
   qc_flag = "check" (base surface probably biased; measure them separately).
+Numbering (after detection):
+  ids are assigned along the arch, not by seed area. Start = the arch end with the smaller
+  coordinate along the lateral axis (+x in the usual scan frame, so left to right when the
+  buccal side faces the viewer). --reverse flips it. --show-ids draws every id so the
+  order can be checked by eye.
 
 This script does NOT compute volumes. src/measure_volume.py reads the labels, the heights
 and the CSV written here.
@@ -31,21 +36,25 @@ and the CSV written here.
 Input : data/<sample>/<scan>.stl   (scan = T1 or T2; detection does not need alignment)
 Output: data/processed/<sample>/
           <scan>_segmented.ply         gray mesh, attachments red
-          <scan>_detection_debug.ply   gray = not evaluated, light green = evaluated,
-                                       orange = seeds, red = attachments
-          <scan>_height_map.ply        stage-1 h (smooth), red = above base, blue = below
           <scan>_attachment_labels.npy int32 per vertex of the CLEANED mesh, -1 = background
           <scan>_attachment_height.npy float32 per vertex: h above the base surface (mm)
                                        for attachment vertices, NaN elsewhere
           <scan>_attachments.csv       one row per attachment (coordinates in the scan frame)
+        only with --debug:
+          <scan>_detection_debug.ply   gray = not evaluated, light green = evaluated,
+                                       orange = seeds, red = attachments
+          <scan>_height_map.ply        stage-1 h (smooth), red = above base, blue = below
 
 Usage:
     python src/detect_attachments.py --sample 1
-    python src/detect_attachments.py --sample 2 --scan T2
-    python src/detect_attachments.py --sample 2 --seed-height 0.4
-    python src/detect_attachments.py --sample 2 --max-rms 0.2
-    python src/detect_attachments.py --sample 2 --min-seed-area 2.0
+    python src/detect_attachments.py --sample 2 --scan T2 --show none
+    python src/detect_attachments.py --sample 1 --show-ids
+    python src/detect_attachments.py --sample 1 --reverse --show-ids
+    python src/detect_attachments.py --sample 2 --seed-height 0.4 --max-rms 0.2
     python src/detect_attachments.py --sample 2 --show heat
+    python src/detect_attachments.py --sample 1 --debug --show none
+    python src/detect_attachments.py --sample 1 --edge-height 0.15 --edge-rel 0.0 --show none
+    python src/detect_attachments.py --sample 1 --ring-in 0.8 --show none
 """
 
 import argparse
@@ -80,7 +89,8 @@ BUCCAL_DOT = 0.35         # min. alignment of normal with the outward arch direc
 DBSCAN_EPS = 0.7          # (at least 2.2 x voxel)
 DBSCAN_MIN_SAMPLES = 5
 SEED_MIN_AREA = 0.5       # mm^2, clusters below this are ignored silently
-# mm^2. true: case 1 >= 3.35, case 2 >= 2.68, case 12 >= 2.48; false: case 1 <= 1.40, case 2 <= 2.05
+# mm^2. true: case 1 >= 3.35, case 2 >= 2.68, case 12 >= 2.48;
+# false: case 1 <= 1.66, case 2 <= 2.05
 MIN_SEED_AREA = 2.3
 # mm. smallest true spacing seen in cases 1, 2, 12 is about 7.0; false duplicate in case 12 was 5.0
 MIN_SEPARATION = 5.5
@@ -109,6 +119,9 @@ MAX_TOP_H = 2.5
 QC_MAX_RING_RMS = 0.10    # mm; kept attachments in cases 1, 2 were 0.025-0.088
 QC_MAX_AREA = 16.0        # mm^2; kept attachments in case 2 were 11-15.5
 
+# --show-ids: length of the leader line drawn outward from each attachment
+LEADER_LENGTH = 6.0
+
 SCANS = ("T1", "T2")
 
 GRAY = [0.72, 0.72, 0.72]
@@ -128,6 +141,12 @@ def load_mesh(path):
     mesh.remove_degenerate_triangles()
     mesh.compute_vertex_normals()
     return mesh
+
+
+def colored(mesh, colors):
+    m = o3d.geometry.TriangleMesh(mesh)
+    m.vertex_colors = o3d.utility.Vector3dVector(colors)
+    return m
 
 
 def edges_of(faces):
@@ -206,14 +225,13 @@ def design_matrix(u, v):
 
 def fit_quadric_robust(u, v, w, passes=3, k=3.0, floor=0.06):
     """
-    Fit w = a u^2 + b uv + c v^2 + d u + e v + f with symmetric trimming (|res| < max(k sigma, floor)).
-    Symmetric on purpose: one-sided trimming at the noise level sinks the surface (failure v3).
-    Returns (coef, rms of kept residuals, kept fraction) or None.
+    Fit w = a u^2 + b uv + c v^2 + d u + e v + f with symmetric trimming
+    (|res| < max(k sigma, floor)). Symmetric on purpose: one-sided trimming at the noise
+    level sinks the surface.
+    Returns (coef, rms of kept residuals) or None.
     """
     A = design_matrix(u, v)
     keep = np.ones(len(u), dtype=bool)
-    coef = None
-    res = None
     for _ in range(passes):
         if keep.sum() < 12:
             return None
@@ -224,19 +242,55 @@ def fit_quadric_robust(u, v, w, passes=3, k=3.0, floor=0.06):
         keep = np.abs(res) < max(k * sigma, floor)
     if keep.sum() < 12 or keep.mean() < 0.5:
         return None
-    return coef, float(np.sqrt(np.mean(res[keep] ** 2))), float(keep.mean())
+    return coef, float(np.sqrt(np.mean(res[keep] ** 2)))
+
+
+def arch_order(centres, occlusal, reverse=False):
+    """
+    Indices that sort attachment centres along the arch.
+    Angles are measured around the centroid in the plane perpendicular to the occlusal axis;
+    the sequence starts after the largest angular gap (the arch opening). Direction: the
+    first attachment is at the end with the smaller coordinate along the lateral axis (the
+    in-plane axis with the larger spread, sign chosen so its largest component is positive).
+    """
+    n = len(centres)
+    if n < 3:
+        return np.arange(n)[::-1] if reverse else np.arange(n)
+    e1, e2 = tangent_frame(occlusal)
+    X = centres - centres.mean(axis=0)
+    p = np.stack([X @ e1, X @ e2], axis=1)
+    ang = np.arctan2(p[:, 1], p[:, 0])
+    order = np.argsort(ang)
+    s = ang[order]
+    gaps = np.diff(np.r_[s, s[0] + 2 * np.pi])
+    order = np.roll(order, -((int(gaps.argmax()) + 1) % n))
+    lat2 = np.linalg.eigh(p.T @ p)[1][:, 1]
+    lat = lat2[0] * e1 + lat2[1] * e2
+    if lat[np.abs(lat).argmax()] < 0:
+        lat = -lat
+    if centres[order[0]] @ lat > centres[order[-1]] @ lat:
+        order = order[::-1]
+    return order[::-1] if reverse else order
+
+
+def height_map_mesh(mesh, h, ok, dist4, idx4):
+    """Stage-1 h interpolated to the native vertices: red = above base, blue = below."""
+    wgt = 1.0 / (dist4 + 1e-6)
+    wgt /= wgt.sum(axis=1, keepdims=True)
+    x = np.clip((np.where(ok, h, 0.0)[idx4] * wgt).sum(axis=1) / 0.4, -1, 1)
+    pos, neg = np.clip(x, 0, 1), np.clip(-x, 0, 1)
+    return colored(mesh, np.stack([1 - neg, 1 - pos - neg, 1 - pos], axis=1))
 
 
 # ---- stage 1 -------------------------------------------------------------------------
 def annulus_height(pts, nrm, query_idx, a):
     """
     h[i] = height of point i above a quadric fitted to its annulus (a.ann_in..a.ann_out).
-    Returns h, rms, ok (fit accepted), base_normal.
+    Returns h, ok (fit accepted), base_normal.
     """
     tree = cKDTree(pts)
     neigh = tree.query_ball_point(pts[query_idx], r=a.ann_out, workers=-1)
     h = np.zeros(len(pts))
-    rms = np.full(len(pts), np.nan)
     ok = np.zeros(len(pts), dtype=bool)
     bn = nrm.copy()
     for i, idx in zip(query_idx, neigh):
@@ -258,8 +312,7 @@ def annulus_height(pts, nrm, query_idx, a):
         fit = fit_quadric_robust(u, v, w)
         if fit is None:
             continue
-        coef, r, _ = fit
-        rms[i] = r
+        coef, r = fit
         if r > a.max_rms:
             continue
         h[i] = -coef[5]
@@ -267,11 +320,12 @@ def annulus_height(pts, nrm, query_idx, a):
         b = n - coef[3] * e1 - coef[4] * e2
         bn[i] = b / np.linalg.norm(b)
         ok[i] = True
-    return h, rms, ok, bn
+    return h, ok, bn
 
 
 # ---- stage 2 -------------------------------------------------------------------------
-def refine_cluster(points, normals, vtree, centre, n_ref, seed_pts):
+def refine_cluster(points, normals, vtree, centre, n_ref, seed_pts,
+                   edge_height=EDGE_HEIGHT, ring_in=RING_IN):
     """
     Ring-based base surface + region growing on native vertices. Returns dict or None.
     The returned h is the height above the LAST ring fit (the base surface of this attachment).
@@ -288,10 +342,12 @@ def refine_cluster(points, normals, vtree, centre, n_ref, seed_pts):
     near_c = np.linalg.norm(rel, axis=1) <= MAX_EXTENT
     normal_ok = N @ n_ref >= RING_NORMAL_DOT
     region = (cKDTree(seed_pts).query(P)[0] <= SEED_RADIUS) & near_c
+    if not region.any():
+        return None
 
     def fit_ring(reg):
         d = cKDTree(P[reg]).query(P)[0]
-        ring = (d >= RING_IN) & (d <= RING_OUT) & normal_ok
+        ring = (d >= ring_in) & (d <= RING_OUT) & normal_ok
         if ring.sum() < 50:
             return None
         fit = fit_quadric_robust(u[ring], v[ring], w[ring])
@@ -300,21 +356,17 @@ def refine_cluster(points, normals, vtree, centre, n_ref, seed_pts):
         return d, w - A @ fit[0], fit[1], int(ring.sum())
 
     for _ in range(REFINE_ITERS):
-        if not region.any():
-            return None
         res = fit_ring(region)
         if res is None:
             break
         d, h, _, _ = res
-        new = (d <= GROW_STEP) & near_c & (h >= EDGE_HEIGHT)
+        new = (d <= GROW_STEP) & near_c & (h >= edge_height)
         if not new.any():
             break
         done = np.array_equal(new, region)
         region = new
         if done:
             break
-    if not region.any():
-        return None
     res = fit_ring(region)
     if res is None:
         return None
@@ -322,50 +374,48 @@ def refine_cluster(points, normals, vtree, centre, n_ref, seed_pts):
     return dict(idx=patch[region], h=h[region], rms=rms, n_ring=n_ring)
 
 
-# ---- validation against the old manual picks (diagnostic only, T1) -------------------
-def check_picks(out_dir, points, labels, centroids, wtree, h, rms, ok, valid):
-    f = out_dir / "picks_T1.npy"
-    if not f.exists():
-        return
-    p = np.load(f)
-    if p.ndim != 2 or p.shape[1] != 3:
+# ---- viewer --------------------------------------------------------------------------
+def show_ids(seg, rows):
+    """
+    Segmented mesh + for every attachment a black leader line (outward) with its id at the
+    tip. A blue -> red line joins the tips in id order (blue = first).
+    """
+    cen = np.array([[r["cx"], r["cy"], r["cz"]] for r in rows])
+    nrm = np.array([[r["nx"], r["ny"], r["nz"]] for r in rows])
+    tips = cen + LEADER_LENGTH * nrm
+    m = len(rows)
+    lines = [[i, m + i]
+             for i in range(m)] + [[m + i, m + i + 1] for i in range(m - 1)]
+    colors = [[0, 0, 0]] * m + [[f, 0, 1 - f]
+                                for f in np.linspace(0, 1, m - 1)]
+    ls = o3d.geometry.LineSet(o3d.utility.Vector3dVector(np.vstack([cen, tips])),
+                              o3d.utility.Vector2iVector(lines))
+    ls.colors = o3d.utility.Vector3dVector(colors)
+    title = "attachment ids (blue -> red = id order)"
+    try:
+        gui = o3d.visualization.gui
+        app = gui.Application.instance
+        app.initialize()
+        vis = o3d.visualization.O3DVisualizer(title, 1280, 800)
+        vis.show_settings = False
+        vis.add_geometry("mesh", seg)
+        mat = o3d.visualization.rendering.MaterialRecord()
+        mat.shader = "unlitLine"
+        mat.line_width = 3.0
+        vis.add_geometry("order", ls, mat)
+        for i, p in enumerate(tips):
+            vis.add_3d_label(p.astype(np.float32), str(i))
+        vis.reset_camera_to_default()
+        app.add_window(vis)
+        app.run()
+    except (AttributeError, TypeError) as e:
         print(
-            f"\n[picks] {f.name} is not a (k,3) coordinate array (shape {p.shape}); skipped.")
-        return
-    cands = {"as saved": p}
-    tf = out_dir / "T1_to_T2.npy"
-    if tf.exists():
-        M = np.linalg.inv(np.load(tf))
-        cands["other frame"] = p @ M[:3, :3].T + M[:3, 3]
-    att = labels >= 0
-    if not att.any():
-        print("\n[picks] no attachments detected, nothing to compare.")
-        return
-    atree = cKDTree(points[att])
-    name = min(cands, key=lambda k: atree.query(cands[k])[0].sum())
-    q = cands[name]
-    print(
-        f"\n[picks] comparing {len(q)} manual picks (frame: {name}); diagnostic only")
-    found = 0
-    for k, pt in enumerate(q):
-        d_reg = atree.query(pt)[0]
-        wi = wtree.query(pt)[1]
-        hit = d_reg <= 1.0
-        found += hit
-        print(f"  pick {k}: dist to nearest attachment region {d_reg:5.2f} mm "
-              f"-> {'FOUND' if hit else 'MISSED'} | stage-1 at pick: h={h[wi]:.2f} "
-              f"rms={rms[wi]:.3f} valid_region={bool(valid[wi])} fit_ok={bool(ok[wi])}")
-    print(
-        f"  picks found: {found}/{len(q)}; detected attachments: {len(centroids)}")
+            f"[!] Text labels not available in this Open3D ({e}); showing lines only")
+        o3d.visualization.draw_geometries([seg, ls], window_name=title,
+                                          width=1024, height=768)
 
 
 # ---- main ----------------------------------------------------------------------------
-def colored(mesh, colors):
-    m = o3d.geometry.TriangleMesh(mesh)
-    m.vertex_colors = o3d.utility.Vector3dVector(colors)
-    return m
-
-
 def main(args):
     scan = args.scan
     in_path = DATA_DIR / args.sample / f"{scan}.stl"
@@ -379,6 +429,8 @@ def main(args):
     normals = np.asarray(mesh.vertex_normals).copy()
     n = len(points)
     print(f"Vertices: {n}")
+    print(f"Stage 2 settings: edge_height={args.edge_height} edge_rel={args.edge_rel} "
+          f"ring_in={args.ring_in}")
 
     # 1. Uniform working point set
     pcd = o3d.geometry.PointCloud()
@@ -400,7 +452,7 @@ def main(args):
           f"{'flipping' if flip else 'keeping'} normals")
     if flip:
         dnrm, normals = -dnrm, -normals
-    mesh.vertex_normals = o3d.utility.Vector3dVector(normals)
+        mesh.vertex_normals = o3d.utility.Vector3dVector(normals)
 
     wtree = cKDTree(dpts)
     dist4, idx4 = wtree.query(points, k=4, workers=-1)
@@ -422,17 +474,10 @@ def main(args):
     # 4. Stage 1
     print(
         f"Stage 1: annulus fits ({args.ann_in}-{args.ann_out} mm) ... takes a little while")
-    h, rms, ok, bn = annulus_height(dpts, dnrm, query_idx, args)
+    h, ok, bn = annulus_height(dpts, dnrm, query_idx, args)
     ok &= valid_region
     print(f"Fits accepted: {ok.sum()} of {len(query_idx)} "
           f"({100 * ok.sum() / max(len(query_idx), 1):.0f} %)")
-    if ok.any():
-        p = np.percentile(h[ok], [1, 50, 99, 99.9])
-        pr = np.nanpercentile(rms[query_idx], [10, 50, 90])
-        print(f"h (accepted) mm: p1 {p[0]:.3f} | p50 {p[1]:.3f} | p99 {p[2]:.3f} | "
-              f"p99.9 {p[3]:.3f} | max {h[ok].max():.3f}")
-        print(
-            f"annulus rms (all evaluated) mm: p10 {pr[0]:.3f} | p50 {pr[1]:.3f} | p90 {pr[2]:.3f}")
 
     seeds = np.where(ok & (h >= args.seed_height))[0]
     print(f"Seed points (h >= {args.seed_height} mm): {len(seeds)}")
@@ -447,23 +492,21 @@ def main(args):
     else:
         print("[!] Too few seeds. Try --seed-height 0.4 or --max-rms 0.2")
 
-    # 6. Stage 2 per cluster, largest seed area first
-    vtree = cKDTree(points)
     clusters = []
     for c in sorted(set(lab_seed) - {-1}):
         mem = np.where(lab_seed == c)[0]
         area = float(wp_area[mem].sum())
-        if area < SEED_MIN_AREA:
-            continue
-        clusters.append((area, c, mem, h[mem].max()))
+        if area >= SEED_MIN_AREA:
+            clusters.append((area, mem, h[mem].max()))
     clusters.sort(key=lambda t: -t[0])
     print(f"\nSeed clusters: {len(clusters)}")
 
-    labels_out = np.full(n, -1, dtype=np.int32)
-    height_out = np.full(n, np.nan, dtype=np.float32)
-    rows = []
-    print("Clusters (largest seed area first, refined on native vertices):")
-    for seed_area, c, mem, hmax_seed in clusters:
+    # 6. Stage 2 per cluster, largest seed area first (this order only decides which of two
+    #    overlapping candidates survives; final ids are assigned afterwards along the arch)
+    vtree = cKDTree(points)
+    taken = np.zeros(n, dtype=bool)
+    kept = []
+    for seed_area, mem, hmax_seed in clusters:
         centre = dpts[mem].mean(axis=0)
         tag = f"seed_area={seed_area:5.2f} h_seed_max={hmax_seed:.2f} at {np.round(centre, 1)}"
         if seed_area < args.min_seed_area:
@@ -472,7 +515,8 @@ def main(args):
             continue
         n_ref = bn[mem].mean(axis=0)
         n_ref /= np.linalg.norm(n_ref)
-        res = refine_cluster(points, normals, vtree, centre, n_ref, dpts[mem])
+        res = refine_cluster(points, normals, vtree, centre, n_ref, dpts[mem],
+                             edge_height=args.edge_height, ring_in=args.ring_in)
         if res is None:
             print(f"  [skip] {tag}: refinement failed (no clean ring)")
             continue
@@ -480,7 +524,8 @@ def main(args):
 
         # cleanup (selection only): relative height cut, then the largest connected piece
         n_before = len(idx)
-        cut = hh >= max(EDGE_HEIGHT, EDGE_REL * float(np.percentile(hh, 95)))
+        cut = hh >= max(args.edge_height, args.edge_rel *
+                        float(np.percentile(hh, 95)))
         idx, hh = idx[cut], hh[cut]
         if len(idx) < MIN_REGION_VERTICES:
             print(f"  [skip] {tag}: region vanished after cleanup")
@@ -495,18 +540,16 @@ def main(args):
         area = float(areas[idx].sum())
         h95 = float(np.percentile(hh, 95))
         h_top = float(hh[hh >= 0.8 * h95].mean())
-        overlap = (labels_out[idx] >= 0).mean()
         cen = points[idx].mean(axis=0)
         reasons = []
-        if overlap > 0.3:
+        if taken[idx].mean() > 0.3:
             reasons.append("duplicate of a kept attachment")
-        if rows:
-            kept_c = np.array([[r_["cx"], r_["cy"], r_["cz"]] for r_ in rows])
-            dmin = np.linalg.norm(kept_c - cen, axis=1)
-            j = int(dmin.argmin())
-            if dmin[j] < args.min_separation:
+        if kept:
+            dmin = np.linalg.norm(
+                np.array([k["cen"] for k in kept]) - cen, axis=1).min()
+            if dmin < args.min_separation:
                 reasons.append(
-                    f"{dmin[j]:.1f} mm from kept #{j} (< {args.min_separation})")
+                    f"{dmin:.1f} mm from a kept attachment (< {args.min_separation})")
         if not (args.min_area <= area <= args.max_area):
             reasons.append(
                 f"area {area:.1f} outside {args.min_area}-{args.max_area}")
@@ -517,73 +560,87 @@ def main(args):
         if reasons:
             print(f"  [skip] {tag} | {info} | {'; '.join(reasons)}")
             continue
-        qc = "check" if (
-            res["rms"] > QC_MAX_RING_RMS or area > QC_MAX_AREA) else "ok"
-        k = len(rows)
-        labels_out[idx] = k
-        height_out[idx] = hh
-        rows.append(dict(id=k, cx=cen[0], cy=cen[1], cz=cen[2], area_mm2=area,
-                         h95_mm=h95, h_top_mm=h_top, n_vertices=len(idx),
-                         ring_rms_mm=res["rms"], nx=n_ref[0], ny=n_ref[1], nz=n_ref[2],
-                         qc_flag=qc))
-        print(
-            f"  [KEEP #{k}{' QC=check' if qc == 'check' else ''}] {tag} | {info}")
+        taken[idx] = True
+        kept.append(dict(
+            idx=idx, h=hh, cen=cen, area=area, h95=h95, h_top=h_top, rms=res["rms"],
+            n_ref=n_ref, tag=tag, info=info,
+            qc="check" if (res["rms"] > QC_MAX_RING_RMS or area > QC_MAX_AREA) else "ok"))
+
+    # 7. Number along the arch
+    labels_out = np.full(n, -1, dtype=np.int32)
+    height_out = np.full(n, np.nan, dtype=np.float32)
+    rows = []
+    order = (arch_order(np.array([k["cen"] for k in kept]), occ, args.reverse)
+             if kept else [])
+    print("\nAttachments in arch order (#0 = first):")
+    for new_id, j in enumerate(order):
+        k = kept[j]
+        labels_out[k["idx"]] = new_id
+        height_out[k["idx"]] = k["h"]
+        rows.append(dict(id=new_id, cx=k["cen"][0], cy=k["cen"][1], cz=k["cen"][2],
+                         area_mm2=k["area"], h95_mm=k["h95"], h_top_mm=k["h_top"],
+                         n_vertices=len(k["idx"]), ring_rms_mm=k["rms"],
+                         nx=k["n_ref"][0], ny=k["n_ref"][1], nz=k["n_ref"][2],
+                         qc_flag=k["qc"]))
+        print(f"  [KEEP #{new_id}{' QC=check' if k['qc'] == 'check' else ''}] "
+              f"{k['tag']} | {k['info']}")
     attach = labels_out >= 0
     n_check = sum(r_["qc_flag"] == "check" for r_ in rows)
     print(
         f"\nAttachments kept: {len(rows)} (expected up to ~14), flagged 'check': {n_check}")
 
-    # 7. Save
+    # 8. Save
     out_dir = PROCESSED_DIR / args.sample
     out_dir.mkdir(parents=True, exist_ok=True)
-
-    # smooth stage-1 height map on the native mesh (inverse-distance weights, 4 neighbours)
-    wgt = 1.0 / (dist4 + 1e-6)
-    wgt /= wgt.sum(axis=1, keepdims=True)
-    h_orig = (np.where(ok, h, 0.0)[idx4] * wgt).sum(axis=1)
-    x = np.clip(h_orig / 0.4, -1, 1)
-    pos, neg = np.clip(x, 0, 1), np.clip(-x, 0, 1)
-    heat = np.stack([1 - neg, 1 - pos - neg, 1 - pos], axis=1)
-    heat_mesh = colored(mesh, heat)
-    o3d.io.write_triangle_mesh(
-        str(out_dir / f"{scan}_height_map.ply"), heat_mesh)
 
     colors = np.tile(GRAY, (n, 1))
     colors[attach] = RED
     seg = colored(mesh, colors)
     o3d.io.write_triangle_mesh(str(out_dir / f"{scan}_segmented.ply"), seg)
 
-    dbg = np.tile(GRAY, (n, 1))
-    dbg[ok[nn] & (dist4[:, 0] <= 1.5 * args.voxel)] = GREEN
-    dbg[(lab_seed[nn] >= 0) & (dist4[:, 0] <= 1.5 * args.voxel)] = ORANGE
-    dbg[attach] = RED
-    o3d.io.write_triangle_mesh(
-        str(out_dir / f"{scan}_detection_debug.ply"), colored(mesh, dbg))
-
     np.save(out_dir / f"{scan}_attachment_labels.npy", labels_out)
     np.save(out_dir / f"{scan}_attachment_height.npy", height_out)
+    csv_path = out_dir / f"{scan}_attachments.csv"
     if rows:
-        with open(out_dir / f"{scan}_attachments.csv", "w", newline="") as f:
+        with open(csv_path, "w", newline="") as f:
             wr = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
             wr.writeheader()
             wr.writerows(rows)
+    elif csv_path.exists():
+        # no stale CSV next to all-background label/height files
+        csv_path.unlink()
+        print(f"[!] No attachments kept: removed stale {csv_path.name}")
+
+    heat_mesh = None
+    if args.debug or (args.show == "heat" and not args.show_ids):
+        heat_mesh = height_map_mesh(mesh, h, ok, dist4, idx4)
+    if args.debug:
+        o3d.io.write_triangle_mesh(
+            str(out_dir / f"{scan}_height_map.ply"), heat_mesh)
+        dbg = np.tile(GRAY, (n, 1))
+        near = dist4[:, 0] <= 1.5 * args.voxel
+        dbg[ok[nn] & near] = GREEN
+        dbg[(lab_seed[nn] >= 0) & near] = ORANGE
+        dbg[attach] = RED
+        o3d.io.write_triangle_mesh(str(out_dir / f"{scan}_detection_debug.ply"),
+                                   colored(mesh, dbg))
     print(f"Saved to {out_dir}")
 
-    if scan == "T1":
-        check_picks(out_dir, points, labels_out, rows,
-                    wtree, h, rms, ok, valid_region)
-
-    if args.show != "none":
+    # 9. View
+    if args.show_ids and rows:
+        show_ids(seg, rows)
+    elif args.show != "none":
+        seg_view = args.show == "seg"
         o3d.visualization.draw_geometries(
-            [seg if args.show == "seg" else heat_mesh],
-            window_name=("attachments (red)" if args.show == "seg"
+            [seg if seg_view else heat_mesh],
+            window_name=("attachments (red)" if seg_view
                          else "h map (red = above base, +-0.4 mm)"),
             width=1024, height=768)
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(
-        description="Detect attachments on one scan automatically (v4.5).")
+        description="Detect attachments on one scan automatically.")
     ap.add_argument("--sample", required=True,
                     help="Sample folder name, e.g. 2")
     ap.add_argument("--scan", choices=SCANS, default="T1",
@@ -605,7 +662,20 @@ if __name__ == "__main__":
     ap.add_argument("--eps", type=float, default=DBSCAN_EPS)
     ap.add_argument("--min-area", type=float, default=MIN_AREA)
     ap.add_argument("--max-area", type=float, default=MAX_AREA)
+    ap.add_argument("--edge-height", type=float, default=EDGE_HEIGHT,
+                    help="region grows to vertices at least this far above the base (mm)")
+    ap.add_argument("--edge-rel", type=float, default=EDGE_REL,
+                    help="cleanup: also at least this fraction of h95 (0 disables)")
+    ap.add_argument("--ring-in", type=float, default=RING_IN,
+                    help="inner radius of the base-surface ring, distance from the region (mm)")
     ap.add_argument("--flip-normals", action="store_true",
                     help="invert the automatic normal orientation decision")
+    ap.add_argument("--reverse", action="store_true",
+                    help="number the attachments from the other end of the arch")
+    ap.add_argument("--debug", action="store_true",
+                    help="also write <scan>_height_map.ply and <scan>_detection_debug.ply")
     ap.add_argument("--show", choices=["seg", "heat", "none"], default="seg")
+    ap.add_argument("--show-ids", action="store_true",
+                    help="open the viewer with every id drawn on a leader line "
+                         "(overrides --show)")
     main(ap.parse_args())
