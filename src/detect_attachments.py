@@ -1,60 +1,40 @@
 """
-Phase 1 - Step 2 : automatic attachment detection on one scan (T1 or T2).
+Automatic attachment detection on one scan (T1, T2 or T1_aligned).
 
-Idea: an attachment is a bump above the tooth surface. The tooth surface under it is
-estimated from a RING AROUND the point (never from the attachment itself).
+Attachments are bumps above the tooth surface. Each one is found in two steps:
+1. Seeds: for each buccal point, a quadric is fitted to a ring around it. Points that
+   sit clearly above that surface are seeds, grouped with DBSCAN.
+2. Region growing: for each seed cluster, the base surface is fitted to a thin ring just
+   outside the region, and the region grows to the vertices above that base. The base
+   from the last ring fit is used for the height and the area.
 
-Stage 1 (seeds, coarse, uniform 0.3 mm working points):
-  for every buccal point, fit a quadric to the annulus r_in..r_out (default 2.0..3.5 mm)
-  using only annulus points with a similar normal. h = height of the point above the fit.
-  The fit is rejected if the annulus is not a clean single surface (too few points,
-  angular coverage too small, residual rms too large): gingival margins, grooves and
-  crown edges are therefore "invalid", not "bumps".
-  Seeds = valid points with h >= SEED_HEIGHT; DBSCAN groups them (no manual picks).
-  Seed clusters with a small area (< MIN_SEED_AREA) are edge effects and are dropped.
-Stage 2 (boundary, native mesh resolution):
-  per cluster (largest seed area first), fit the base surface to a thin ring just outside
-  the current region (wall points removed by a normal filter), grow the region to vertices
-  with h >= EDGE_HEIGHT, repeat a few times. The LAST ring fit of this loop is THE base
-  surface of the attachment: every number written by this project (h95, h_top, volume)
-  uses the h of this one fit. Nothing is re-fitted later.
-  Cleanup (selection only, the base surface is not touched): drop vertices below
-  EDGE_REL x h95 (low bulges of neighbouring teeth) and keep only the largest connected
-  piece on the mesh (by surface area). Attachment = what remains.
-  Two attachments closer than MIN_SEPARATION are treated as duplicates (one per tooth).
-  Attachments whose ring fit is poor or whose region is unusually large get
-  qc_flag = "check" (base surface probably biased; measure them separately).
-Numbering (after detection):
-  ids are assigned along the arch, not by seed area. Start = the arch end with the smaller
-  coordinate along the lateral axis (+x in the usual scan frame, so left to right when the
-  buccal side faces the viewer). --reverse flips it. --show-ids draws every id so the
-  order can be checked by eye.
+Clusters with a large seed area are accepted directly. Smaller ones only fill free slots
+up to EXPECTED_COUNT, and only with a clean ring fit. Candidates are rejected for overlap,
+spacing, area or height. qc_flag = "check" marks a poor ring fit or a large area; it does
+not reject the attachment.
 
-This script does NOT compute volumes. src/measure_volume.py reads the labels, the heights
-and the CSV written here.
+Numbering runs along the arch, starting from the end with the smaller lateral coordinate.
+--reverse flips the order; --show-ids draws the ids.
 
-Input : data/<sample>/<scan>.stl   (scan = T1 or T2; detection does not need alignment)
+T1_aligned is T1 moved into the T2 frame by align.py. Its label and height files index
+T1_aligned.stl, not T1.stl. Volumes are computed by measure_volume.py.
+
+Input : data/<sample>/<scan>.stl   (T1_aligned: data/processed/<sample>/T1_aligned.stl)
 Output: data/processed/<sample>/
-          <scan>_segmented.ply         gray mesh, attachments red
-          <scan>_attachment_labels.npy int32 per vertex of the CLEANED mesh, -1 = background
-          <scan>_attachment_height.npy float32 per vertex: h above the base surface (mm)
-                                       for attachment vertices, NaN elsewhere
-          <scan>_attachments.csv       one row per attachment (coordinates in the scan frame)
-        only with --debug:
-          <scan>_detection_debug.ply   gray = not evaluated, light green = evaluated,
-                                       orange = seeds, red = attachments
-          <scan>_height_map.ply        stage-1 h (smooth), red = above base, blue = below
+          <scan>_segmented.ply           attachments in red
+          <scan>_attachment_labels.npy   int32 per vertex, -1 = background
+          <scan>_attachment_height.npy   float32 height in mm, NaN elsewhere
+          <scan>_attachments.csv         one row per attachment
+        with --debug also:
+          <scan>_detection_debug.ply     gray = not evaluated, green = evaluated,
+                                         orange = seeds, red = attachments
+          <scan>_height_map.ply          red = above base, blue = below
 
 Usage:
     python src/detect_attachments.py --sample 1
     python src/detect_attachments.py --sample 2 --scan T2 --show none
     python src/detect_attachments.py --sample 1 --show-ids
-    python src/detect_attachments.py --sample 1 --reverse --show-ids
-    python src/detect_attachments.py --sample 2 --seed-height 0.4 --max-rms 0.2
-    python src/detect_attachments.py --sample 2 --show heat
     python src/detect_attachments.py --sample 1 --debug --show none
-    python src/detect_attachments.py --sample 1 --edge-height 0.15 --edge-rel 0.0 --show none
-    python src/detect_attachments.py --sample 1 --ring-in 0.8 --show none
 """
 
 import argparse
@@ -89,9 +69,13 @@ BUCCAL_DOT = 0.35         # min. alignment of normal with the outward arch direc
 DBSCAN_EPS = 0.7          # (at least 2.2 x voxel)
 DBSCAN_MIN_SAMPLES = 5
 SEED_MIN_AREA = 0.5       # mm^2, clusters below this are ignored silently
-# mm^2. true: case 1 >= 3.35, case 2 >= 2.68, case 12 >= 2.48;
-# false: case 1 <= 1.66, case 2 <= 2.05
+# mm^2. Clusters at or above this are accepted on their own.
+# true: case 1 >= 3.35, case 2 T1 >= 2.68, case 12 >= 2.48; case 2 T2 has one true
+# attachment at 0.78 (fragmented seeds). false: 1.38 (T1), 1.63 (T2). Seed area cannot
+# separate them, so smaller clusters only fill free slots (see EXPECTED_COUNT).
 MIN_SEED_AREA = 2.3
+# attachments per scan (reference Excel); 0 = no slot filling
+EXPECTED_COUNT = 14
 # mm. smallest true spacing seen in cases 1, 2, 12 is about 7.0; false duplicate in case 12 was 5.0
 MIN_SEPARATION = 5.5
 
@@ -112,17 +96,18 @@ MIN_REGION_VERTICES = 20
 MIN_AREA = 2.0            # mm^2 (footprint, real surface area)
 MAX_AREA = 25.0
 MIN_TOP_H = 0.5           # mm, 95th percentile of h inside the region
-# true: case 1 0.77-1.05, case 2 1.07-1.77, case 12 1.26-2.23; wrong base: >= 2.7
+# true: case 1 0.77-1.05, case 2 1.02-2.01, case 12 1.26-2.23; wrong base: >= 2.7
 MAX_TOP_H = 2.5
 
-# QC flag (not a rejection): base surface probably biased
-QC_MAX_RING_RMS = 0.10    # mm; kept attachments in cases 1, 2 were 0.025-0.088
-QC_MAX_AREA = 16.0        # mm^2; kept attachments in case 2 were 11-15.5
+# QC flag (not a rejection): base surface probably biased.
+# Also the limit for attachments accepted from weak seed clusters.
+QC_MAX_RING_RMS = 0.10    # mm; kept attachments in case 2 were 0.038-0.160
+QC_MAX_AREA = 16.0        # mm^2; kept attachments in case 2 were 9-16.3
 
 # --show-ids: length of the leader line drawn outward from each attachment
 LEADER_LENGTH = 6.0
 
-SCANS = ("T1", "T2")
+SCANS = ("T1", "T2", "T1_aligned")
 
 GRAY = [0.72, 0.72, 0.72]
 GREEN = [0.80, 0.93, 0.80]
@@ -131,6 +116,13 @@ ORANGE = [1.0, 0.55, 0.0]
 
 
 # ---- helpers -------------------------------------------------------------------------
+def scan_path(sample, scan):
+    """Raw scans are in data/<sample>; T1_aligned.stl is written by align.py."""
+    if scan == "T1_aligned":
+        return PROCESSED_DIR / sample / "T1_aligned.stl"
+    return DATA_DIR / sample / f"{scan}.stl"
+
+
 def load_mesh(path):
     """
     The one place where a scan is read and cleaned. Vertex order of the result is the order
@@ -240,8 +232,8 @@ def fit_quadric_robust(u, v, w, passes=3, k=3.0, floor=0.06):
         med = np.median(res[keep])
         sigma = 1.4826 * np.median(np.abs(res[keep] - med))
         keep = np.abs(res) < max(k * sigma, floor)
-    if keep.sum() < 12 or keep.mean() < 0.5:
-        return None
+        if keep.sum() < 12 or keep.mean() < 0.5:
+            return None
     return coef, float(np.sqrt(np.mean(res[keep] ** 2)))
 
 
@@ -374,6 +366,84 @@ def refine_cluster(points, normals, vtree, centre, n_ref, seed_pts,
     return dict(idx=patch[region], h=h[region], rms=rms, n_ring=n_ring)
 
 
+def grow_candidate(mem, dpts, bn, ctx, args):
+    """
+    Stage 2 + cleanup for one seed cluster (member indices into the working points).
+    Returns (candidate dict, "") or (None, reason).
+    """
+    points, normals, vtree, areas, edges = ctx
+    centre = dpts[mem].mean(axis=0)
+    n_ref = bn[mem].mean(axis=0)
+    n_ref /= np.linalg.norm(n_ref)
+    res = refine_cluster(points, normals, vtree, centre, n_ref, dpts[mem],
+                         edge_height=args.edge_height, ring_in=args.ring_in)
+    if res is None:
+        return None, "refinement failed (no clean ring)"
+    idx, hh = res["idx"], res["h"]
+
+    # cleanup (selection only): relative height cut, then the largest connected piece
+    n_before = len(idx)
+    cut = hh >= max(args.edge_height, args.edge_rel *
+                    float(np.percentile(hh, 95)))
+    idx, hh = idx[cut], hh[cut]
+    if len(idx) < MIN_REGION_VERTICES:
+        return None, "region vanished after cleanup"
+    comp = largest_component(idx, edges, areas, len(points))
+    idx, hh = idx[comp], hh[comp]
+    if len(idx) < MIN_REGION_VERTICES:
+        return None, "region too small after cleanup"
+
+    area = float(areas[idx].sum())
+    h95 = float(np.percentile(hh, 95))
+    cand = dict(
+        idx=idx, h=hh, cen=points[idx].mean(axis=0), area=area, h95=h95,
+        h_top=float(hh[hh >= 0.8 * h95].mean()), rms=res["rms"], n_ring=res["n_ring"],
+        trim=100.0 * (1 - len(idx) / n_before), n_ref=n_ref,
+        qc="check" if (res["rms"] > QC_MAX_RING_RMS or area > QC_MAX_AREA) else "ok")
+    return cand, ""
+
+
+def gate_reasons(c, kept, taken, args):
+    """Reasons to reject a candidate given the attachments kept so far (empty = accept)."""
+    reasons = []
+    if taken[c["idx"]].mean() > 0.3:
+        reasons.append("duplicate of a kept attachment")
+    if kept:
+        dmin = np.linalg.norm(np.array([k["cen"]
+                                        for k in kept]) - c["cen"], axis=1).min()
+        if dmin < args.min_separation:
+            reasons.append(
+                f"{dmin:.1f} mm from a kept attachment (< {args.min_separation})")
+    if not (args.min_area <= c["area"] <= args.max_area):
+        reasons.append(
+            f"area {c['area']:.1f} outside {args.min_area}-{args.max_area}")
+    if not (MIN_TOP_H <= c["h95"] <= MAX_TOP_H):
+        reasons.append(f"h95 {c['h95']:.2f} outside {MIN_TOP_H}-{MAX_TOP_H}")
+    return reasons
+
+
+def describe(c):
+    return (f"area={c['area']:5.2f} mm2 h95={c['h95']:.2f} h_top={c['h_top']:.2f} "
+            f"ring_rms={c['rms']:.3f} n_ring={c['n_ring']} trim={c['trim']:.0f}%")
+
+
+def evaluate_cluster(seed_area, mem, dpts, bn, h, ctx, kept, taken, args):
+    """Returns (tag, candidate or None, list of rejection reasons)."""
+    centre = dpts[mem].mean(axis=0)
+    tag = (f"seed_area={seed_area:5.2f} h_seed_max={h[mem].max():.2f} "
+           f"at {np.round(centre, 1)}")
+    c, why = grow_candidate(mem, dpts, bn, ctx, args)
+    if c is None:
+        return tag, None, [why]
+    c["tag"] = tag
+    return tag, c, gate_reasons(c, kept, taken, args)
+
+
+def report_skip(tag, c, reasons):
+    info = f" | {describe(c)}" if c is not None else ""
+    print(f"  [skip] {tag}{info} | {'; '.join(reasons)}")
+
+
 # ---- viewer --------------------------------------------------------------------------
 def show_ids(seg, rows):
     """
@@ -418,10 +488,11 @@ def show_ids(seg, rows):
 # ---- main ----------------------------------------------------------------------------
 def main(args):
     scan = args.scan
-    in_path = DATA_DIR / args.sample / f"{scan}.stl"
+    in_path = scan_path(args.sample, scan)
     print(f"Input: {in_path}")
     if not in_path.exists():
-        raise SystemExit(f"Missing file: {in_path}")
+        hint = " (run align.py first)" if scan == "T1_aligned" else ""
+        raise SystemExit(f"Missing file: {in_path}{hint}")
 
     mesh = load_mesh(in_path)
     points = np.asarray(mesh.vertices)
@@ -497,74 +568,55 @@ def main(args):
         mem = np.where(lab_seed == c)[0]
         area = float(wp_area[mem].sum())
         if area >= SEED_MIN_AREA:
-            clusters.append((area, mem, h[mem].max()))
+            clusters.append((area, mem))
     clusters.sort(key=lambda t: -t[0])
-    print(f"\nSeed clusters: {len(clusters)}")
+    strong = [t for t in clusters if t[0] >= args.min_seed_area]
+    weak = [t for t in clusters if t[0] < args.min_seed_area]
+    print(f"\nSeed clusters: {len(clusters)} "
+          f"({len(strong)} with seed area >= {args.min_seed_area}, {len(weak)} smaller)")
 
-    # 6. Stage 2 per cluster, largest seed area first (this order only decides which of two
-    #    overlapping candidates survives; final ids are assigned afterwards along the arch)
-    vtree = cKDTree(points)
+    # 6. Stage 2. Strong clusters first (largest seed area first; this order only decides
+    #    which of two overlapping candidates survives). Final ids are assigned afterwards.
+    ctx = (points, normals, cKDTree(points), areas, mesh_edges)
     taken = np.zeros(n, dtype=bool)
     kept = []
-    for seed_area, mem, hmax_seed in clusters:
-        centre = dpts[mem].mean(axis=0)
-        tag = f"seed_area={seed_area:5.2f} h_seed_max={hmax_seed:.2f} at {np.round(centre, 1)}"
-        if seed_area < args.min_seed_area:
-            print(
-                f"  [skip] {tag} | seed area < {args.min_seed_area} (edge effect)")
-            continue
-        n_ref = bn[mem].mean(axis=0)
-        n_ref /= np.linalg.norm(n_ref)
-        res = refine_cluster(points, normals, vtree, centre, n_ref, dpts[mem],
-                             edge_height=args.edge_height, ring_in=args.ring_in)
-        if res is None:
-            print(f"  [skip] {tag}: refinement failed (no clean ring)")
-            continue
-        idx, hh = res["idx"], res["h"]
 
-        # cleanup (selection only): relative height cut, then the largest connected piece
-        n_before = len(idx)
-        cut = hh >= max(args.edge_height, args.edge_rel *
-                        float(np.percentile(hh, 95)))
-        idx, hh = idx[cut], hh[cut]
-        if len(idx) < MIN_REGION_VERTICES:
-            print(f"  [skip] {tag}: region vanished after cleanup")
-            continue
-        comp = largest_component(idx, mesh_edges, areas, n)
-        idx, hh = idx[comp], hh[comp]
-        if len(idx) < MIN_REGION_VERTICES:
-            print(f"  [skip] {tag}: region too small after cleanup")
-            continue
-        trim = 100.0 * (1 - len(idx) / n_before)
-
-        area = float(areas[idx].sum())
-        h95 = float(np.percentile(hh, 95))
-        h_top = float(hh[hh >= 0.8 * h95].mean())
-        cen = points[idx].mean(axis=0)
-        reasons = []
-        if taken[idx].mean() > 0.3:
-            reasons.append("duplicate of a kept attachment")
-        if kept:
-            dmin = np.linalg.norm(
-                np.array([k["cen"] for k in kept]) - cen, axis=1).min()
-            if dmin < args.min_separation:
-                reasons.append(
-                    f"{dmin:.1f} mm from a kept attachment (< {args.min_separation})")
-        if not (args.min_area <= area <= args.max_area):
-            reasons.append(
-                f"area {area:.1f} outside {args.min_area}-{args.max_area}")
-        if not (MIN_TOP_H <= h95 <= MAX_TOP_H):
-            reasons.append(f"h95 {h95:.2f} outside {MIN_TOP_H}-{MAX_TOP_H}")
-        info = (f"area={area:5.2f} mm2 h95={h95:.2f} h_top={h_top:.2f} "
-                f"ring_rms={res['rms']:.3f} n_ring={res['n_ring']} trim={trim:.0f}%")
+    for seed_area, mem in strong:
+        tag, c, reasons = evaluate_cluster(seed_area, mem, dpts, bn, h, ctx,
+                                           kept, taken, args)
         if reasons:
-            print(f"  [skip] {tag} | {info} | {'; '.join(reasons)}")
+            report_skip(tag, c, reasons)
             continue
-        taken[idx] = True
-        kept.append(dict(
-            idx=idx, h=hh, cen=cen, area=area, h95=h95, h_top=h_top, rms=res["rms"],
-            n_ref=n_ref, tag=tag, info=info,
-            qc="check" if (res["rms"] > QC_MAX_RING_RMS or area > QC_MAX_AREA) else "ok"))
+        taken[c["idx"]] = True
+        kept.append(c)
+
+    # Smaller clusters only fill free slots, best (cleanest) ring first
+    slots = max(args.expected_count - len(kept), 0)
+    if weak and slots == 0:
+        print(f"  {len(weak)} smaller seed clusters ignored "
+              f"(no free slot, expected count {args.expected_count})")
+    elif weak:
+        print(f"  {slots} free slot(s): checking {len(weak)} smaller seed clusters "
+              f"(ring_rms <= {QC_MAX_RING_RMS} required)")
+        pool = []
+        for seed_area, mem in weak:
+            tag, c, reasons = evaluate_cluster(seed_area, mem, dpts, bn, h, ctx,
+                                               kept, taken, args)
+            if c is not None and c["rms"] > QC_MAX_RING_RMS:
+                reasons.append(f"ring_rms {c['rms']:.3f} > {QC_MAX_RING_RMS}")
+            if reasons:
+                report_skip(tag, c, reasons)
+            else:
+                pool.append(c)
+        pool.sort(key=lambda c: c["rms"])
+        for c in pool:
+            reasons = gate_reasons(c, kept, taken, args) if len(kept) < args.expected_count \
+                else ["no free slot"]
+            if reasons:
+                report_skip(c["tag"], c, reasons)
+                continue
+            taken[c["idx"]] = True
+            kept.append(c)
 
     # 7. Number along the arch
     labels_out = np.full(n, -1, dtype=np.int32)
@@ -583,11 +635,14 @@ def main(args):
                          nx=k["n_ref"][0], ny=k["n_ref"][1], nz=k["n_ref"][2],
                          qc_flag=k["qc"]))
         print(f"  [KEEP #{new_id}{' QC=check' if k['qc'] == 'check' else ''}] "
-              f"{k['tag']} | {k['info']}")
+              f"{k['tag']} | {describe(k)}")
     attach = labels_out >= 0
     n_check = sum(r_["qc_flag"] == "check" for r_ in rows)
-    print(
-        f"\nAttachments kept: {len(rows)} (expected up to ~14), flagged 'check': {n_check}")
+    print(f"\nAttachments kept: {len(rows)} (expected {args.expected_count}), "
+          f"flagged 'check': {n_check}")
+    if args.expected_count and len(rows) != args.expected_count:
+        print(f"[!] Count differs from {args.expected_count}: a missed or false detection "
+              f"shifts the ids after it. Check the [skip] lines and the viewer.")
 
     # 8. Save
     out_dir = PROCESSED_DIR / args.sample
@@ -612,7 +667,7 @@ def main(args):
         print(f"[!] No attachments kept: removed stale {csv_path.name}")
 
     heat_mesh = None
-    if args.debug or (args.show == "heat" and not args.show_ids):
+    if args.debug or args.show == "heat":
         heat_mesh = height_map_mesh(mesh, h, ok, dist4, idx4)
     if args.debug:
         o3d.io.write_triangle_mesh(
@@ -644,7 +699,7 @@ if __name__ == "__main__":
     ap.add_argument("--sample", required=True,
                     help="Sample folder name, e.g. 2")
     ap.add_argument("--scan", choices=SCANS, default="T1",
-                    help="which scan to process")
+                    help="which scan to process (T1_aligned needs align.py first)")
     ap.add_argument("--voxel", type=float, default=VOXEL)
     ap.add_argument("--ann-in", type=float, default=ANN_IN)
     ap.add_argument("--ann-out", type=float, default=ANN_OUT)
@@ -654,7 +709,10 @@ if __name__ == "__main__":
     ap.add_argument("--max-rms", type=float, default=ANN_MAX_RMS)
     ap.add_argument("--seed-height", type=float, default=SEED_HEIGHT)
     ap.add_argument("--min-seed-area", type=float, default=MIN_SEED_AREA,
-                    help="drop seed clusters smaller than this (mm^2)")
+                    help="seed clusters at least this big (mm^2) are accepted on their own; "
+                         "smaller ones only fill free slots up to --expected-count")
+    ap.add_argument("--expected-count", type=int, default=EXPECTED_COUNT,
+                    help="attachments per scan; 0 = never accept smaller seed clusters")
     ap.add_argument("--min-separation", type=float, default=MIN_SEPARATION,
                     help="min. distance between two attachments (mm)")
     ap.add_argument("--buccal-dot", type=float, default=BUCCAL_DOT,

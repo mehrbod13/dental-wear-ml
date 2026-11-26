@@ -1,5 +1,7 @@
+# src/measure_volume.py
 """
-Phase 1 - Step 3a: volume of the detected attachments, for T1 (pre) and T2 (post).
+Phase 1 - Step 3a: volume of the detected attachments, for every detected scan
+(T1, T2, T1_aligned) found in data/processed/<sample>/.
 
 This script does NOT fit any surface. The base surface of every attachment was fitted once
 by detect_attachments.py, which saved the height h of each attachment vertex above it.
@@ -14,22 +16,17 @@ Per attachment, per scan:
 
 Known bias: triangles that touch the mask border are not counted, and the low foot of the
 attachment (below the detector's height cut) is outside the mask, so absolute volumes are
-slightly low. The same code is used for T1 and T2.
+slightly low. The same code is used for every scan.
 
 Consistency check: h95 of the heights file must equal h95_mm in the CSV, otherwise the
 files come from different detection runs (yellow warning).
 
-Output: data/processed/<sample>/volumes.csv with columns id, pre_volume_mm3, post_volume_mm3
-  - One scan missing: its column is left empty and a yellow warning is printed.
-  - Both scans missing (or no attachments at all): an error is raised and NO file is written.
-  - Rows are joined by attachment id only. T1 and T2 are detected independently, so the same
-    id is NOT guaranteed to be the same physical attachment.
+Output: data/processed/<sample>/volumes.csv with columns id, <scan>_volume_mm3 for every
+scan that has an attachments CSV (e.g. T1_volume_mm3, T2_volume_mm3, T1_aligned_volume_mm3).
 
-Input (per scan = T1, T2):
-        data/<sample>/<scan>.stl
-        data/processed/<sample>/<scan>_attachment_labels.npy
-        data/processed/<sample>/<scan>_attachment_height.npy
-        data/processed/<sample>/<scan>_attachments.csv
+Input (per scan): <scan>_attachments.csv, <scan>_attachment_labels.npy,
+        <scan>_attachment_height.npy in data/processed/<sample>/, and the mesh
+        (data/<sample>/<scan>.stl, T1_aligned: data/processed/<sample>/T1_aligned.stl)
 
 Usage:
     python src/measure_volume.py --sample 2
@@ -40,12 +37,10 @@ import csv
 
 import numpy as np
 
-from config import DATA_DIR, PROCESSED_DIR, PROJECT_ROOT
-from detect_attachments import load_mesh
+from config import PROCESSED_DIR, PROJECT_ROOT
+from detect_attachments import SCANS, load_mesh, scan_path
 
-# (file prefix, label in the csv header)
-SCANS = (("T1", "pre"), ("T2", "post"))
-H95_TOL = 1e-3                              # mm
+H95_TOL = 1e-3  # mm
 
 
 def warn(msg):
@@ -77,21 +72,20 @@ def measure_attachment(points, faces, labels, height, row):
                 h95=float(np.percentile(h_mask, 95)))
 
 
-def measure_scan(sample, scan, label):
+def measure_scan(sample, scan):
     """
     Returns {id: volume in mm3 or None} for one scan, or None if the scan cannot be measured
     (a yellow warning is printed in that case). A failed attachment keeps its id with None.
     """
     out_dir = PROCESSED_DIR / sample
-    paths = {"mesh": DATA_DIR / sample / f"{scan}.stl",
+    paths = {"mesh": scan_path(sample, scan),
              "labels": out_dir / f"{scan}_attachment_labels.npy",
              "height": out_dir / f"{scan}_attachment_height.npy",
              "csv": out_dir / f"{scan}_attachments.csv"}
     missing = [str(p.relative_to(PROJECT_ROOT))
                for p in paths.values() if not p.exists()]
     if missing:
-        warn(
-            f"{scan} ({label}): missing {', '.join(missing)} -> {label} column left empty")
+        warn(f"{scan}: missing {', '.join(missing)} -> column left empty")
         return None
 
     mesh = load_mesh(paths["mesh"])
@@ -100,12 +94,12 @@ def measure_scan(sample, scan, label):
     labels = np.load(paths["labels"])
     height = np.load(paths["height"]).astype(np.float64)
     if len(labels) != len(points) or len(height) != len(points):
-        warn(f"{scan} ({label}): labels ({len(labels)}) / heights ({len(height)}) do not match "
-             f"mesh vertices ({len(points)}) -> {label} column left empty")
+        warn(f"{scan}: labels ({len(labels)}) / heights ({len(height)}) do not match "
+             f"mesh vertices ({len(points)}) -> column left empty")
         return None
     with open(paths["csv"], newline="") as f:
         att = list(csv.DictReader(f))
-    print(f"\n[{scan} / {label}] attachments in CSV: {len(att)}")
+    print(f"\n[{scan}] attachments in CSV: {len(att)}")
 
     result = {}
     print(" id  qc     area_proj  mean_h  volume   h95    (terminal only)")
@@ -120,39 +114,43 @@ def measure_scan(sample, scan, label):
             warn(f"{scan} #{k}: mask has {res['n_mask_vertices']} vertices, "
                  f"CSV says {row['n_vertices']} (files from different runs?)")
         if abs(res["h95"] - float(row["h95_mm"])) > H95_TOL:
-            warn(f"{scan} #{k}: h95 from heights {res['h95']:.4f} != CSV {float(row['h95_mm']):.4f} "
-                 f"(files from different runs?)")
+            warn(f"{scan} #{k}: h95 from heights {res['h95']:.4f} != CSV "
+                 f"{float(row['h95_mm']):.4f} (files from different runs?)")
         print(f"{k:3d}  {row['qc_flag']:5s}  {res['area_proj']:8.2f}  {res['mean_h']:6.3f}  "
               f"{res['volume']:6.2f}  {res['h95']:5.2f}")
         result[k] = res["volume"]
 
     vols = np.array([v for v in result.values() if v is not None])
     if len(vols):
-        print(f"[{scan} / {label}] volume mm3: mean {vols.mean():.2f} | min {vols.min():.2f} | "
+        print(f"[{scan}] volume mm3: mean {vols.mean():.2f} | min {vols.min():.2f} | "
               f"max {vols.max():.2f} (n = {len(vols)})")
     return result
 
 
 def main(args):
-    results = {label: measure_scan(args.sample, scan, label)
-               for scan, label in SCANS}
+    out_dir = PROCESSED_DIR / args.sample
+    found = [s for s in SCANS if (out_dir / f"{s}_attachments.csv").exists()]
+    if not found:
+        raise SystemExit(f"\033[31m[ERROR] No <scan>_attachments.csv in {out_dir}. "
+                         "volumes.csv was NOT written. "
+                         "Run detect_attachments.py first.\033[0m")
+    print(f"Scans found: {', '.join(found)}")
 
+    results = {scan: measure_scan(args.sample, scan) for scan in found}
     available = {s: r for s, r in results.items() if r is not None}
     if not available:
-        raise SystemExit("\033[31m[ERROR] Neither T1 nor T2 could be measured "
-                         "(see warnings above). volumes.csv was NOT written. "
-                         "Run detect_attachments.py first.\033[0m")
+        raise SystemExit("\033[31m[ERROR] No scan could be measured "
+                         "(see warnings above). volumes.csv was NOT written.\033[0m")
     ids = sorted(set().union(*[r.keys() for r in available.values()]))
     if not ids:
         raise SystemExit("\033[31m[ERROR] No attachments found in any scan. "
                          "volumes.csv was NOT written.\033[0m")
     counts = {s: len(r) for s, r in available.items()}
-    if len(counts) == 2 and len(set(counts.values())) > 1:
+    if len(set(counts.values())) > 1:
         warn(
             f"different number of attachments ({counts}); rows are joined by id only")
 
-    columns = ["id"] + [f"{label}_volume_mm3" for _, label in SCANS]
-    out_dir = PROCESSED_DIR / args.sample
+    columns = ["id"] + [f"{s}_volume_mm3" for s in found]
     out_dir.mkdir(parents=True, exist_ok=True)
     dst = out_dir / "volumes.csv"
     with open(dst, "w", newline="") as f:
@@ -160,17 +158,16 @@ def main(args):
         wr.writeheader()
         for k in ids:
             row = {"id": k}
-            for _, label in SCANS:
-                v = results[label].get(
-                    k) if results[label] is not None else None
-                row[f"{label}_volume_mm3"] = "" if v is None else f"{v:.4f}"
+            for s in found:
+                v = results[s].get(k) if results[s] is not None else None
+                row[f"{s}_volume_mm3"] = "" if v is None else f"{v:.4f}"
             wr.writerow(row)
     print(f"\nSaved {dst}")
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(
-        description="Volume of detected attachments (pre = T1, post = T2).")
+        description="Volume of detected attachments for every detected scan of a sample.")
     ap.add_argument("--sample", required=True,
                     help="Sample folder name, e.g. 2")
     main(ap.parse_args())
