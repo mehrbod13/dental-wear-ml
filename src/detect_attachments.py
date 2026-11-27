@@ -49,7 +49,6 @@ from sklearn.cluster import DBSCAN
 
 from config import DATA_DIR, PROCESSED_DIR
 
-
 # ---- All lengths in millimetres ------------------------------------------------------
 # spacing of the working point set (same for fine/coarse scans)
 VOXEL = 0.3
@@ -194,8 +193,8 @@ def radial_directions(points, occlusal, mid):
     """Unit vectors from the arch centre, perpendicular to the occlusal axis."""
     v = points - mid
     v = v - np.outer(v @ occlusal, occlusal)
-    r = np.linalg.norm(v, axis=1)
-    return v / (r[:, None] + 1e-9), r
+    radius = np.linalg.norm(v, axis=1)
+    return v / (radius[:, None] + 1e-9), radius
 
 
 def flat_dot(normals, radial, occlusal):
@@ -304,8 +303,8 @@ def annulus_height(pts, nrm, query_idx, a):
         fit = fit_quadric_robust(u, v, w)
         if fit is None:
             continue
-        coef, r = fit
-        if r > a.max_rms:
+        coef, rms = fit
+        if rms > a.max_rms:
             continue
         h[i] = -coef[5]
         # normal of the base surface at the point
@@ -380,7 +379,6 @@ def grow_candidate(mem, dpts, bn, ctx, args):
     if res is None:
         return None, "refinement failed (no clean ring)"
     idx, hh = res["idx"], res["h"]
-
     # cleanup (selection only): relative height cut, then the largest connected piece
     n_before = len(idx)
     cut = hh >= max(args.edge_height, args.edge_rel *
@@ -392,7 +390,6 @@ def grow_candidate(mem, dpts, bn, ctx, args):
     idx, hh = idx[comp], hh[comp]
     if len(idx) < MIN_REGION_VERTICES:
         return None, "region too small after cleanup"
-
     area = float(areas[idx].sum())
     h95 = float(np.percentile(hh, 95))
     cand = dict(
@@ -409,8 +406,8 @@ def gate_reasons(c, kept, taken, args):
     if taken[c["idx"]].mean() > 0.3:
         reasons.append("duplicate of a kept attachment")
     if kept:
-        dmin = np.linalg.norm(np.array([k["cen"]
-                                        for k in kept]) - c["cen"], axis=1).min()
+        dmin = np.linalg.norm(np.array([k["cen"] for k in kept]) - c["cen"],
+                              axis=1).min()
         if dmin < args.min_separation:
             reasons.append(
                 f"{dmin:.1f} mm from a kept attachment (< {args.min_separation})")
@@ -515,8 +512,8 @@ def main(args):
 
     # 2. Orient normals outward (outermost 15 % of the arch must face away from the centre)
     occ, mid = arch_geometry(dpts)
-    radial, r = radial_directions(dpts, occ, mid)
-    outer = r >= np.percentile(r, 85)
+    radial, radius = radial_directions(dpts, occ, mid)
+    outer = radius >= np.percentile(radius, 85)
     frac = float((flat_dot(dnrm[outer], radial[outer], occ) > 0).mean())
     flip = (frac < 0.5) != args.flip_normals
     print(f"Outward-facing fraction on the outer arch: {frac:.2f} -> "
@@ -546,7 +543,6 @@ def main(args):
     print(
         f"Stage 1: annulus fits ({args.ann_in}-{args.ann_out} mm) ... takes a little while")
     h, ok, bn = annulus_height(dpts, dnrm, query_idx, args)
-    ok &= valid_region
     print(f"Fits accepted: {ok.sum()} of {len(query_idx)} "
           f"({100 * ok.sum() / max(len(query_idx), 1):.0f} %)")
 
@@ -610,8 +606,10 @@ def main(args):
                 pool.append(c)
         pool.sort(key=lambda c: c["rms"])
         for c in pool:
-            reasons = gate_reasons(c, kept, taken, args) if len(kept) < args.expected_count \
-                else ["no free slot"]
+            if len(kept) < args.expected_count:
+                reasons = gate_reasons(c, kept, taken, args)
+            else:
+                reasons = ["no free slot"]
             if reasons:
                 report_skip(c["tag"], c, reasons)
                 continue
@@ -622,8 +620,8 @@ def main(args):
     labels_out = np.full(n, -1, dtype=np.int32)
     height_out = np.full(n, np.nan, dtype=np.float32)
     rows = []
-    order = (arch_order(np.array([k["cen"] for k in kept]), occ, args.reverse)
-             if kept else [])
+    order = arch_order(np.array([k["cen"] for k in kept]),
+                       occ, args.reverse) if kept else []
     print("\nAttachments in arch order (#0 = first):")
     for new_id, j in enumerate(order):
         k = kept[j]
@@ -637,7 +635,7 @@ def main(args):
         print(f"  [KEEP #{new_id}{' QC=check' if k['qc'] == 'check' else ''}] "
               f"{k['tag']} | {describe(k)}")
     attach = labels_out >= 0
-    n_check = sum(r_["qc_flag"] == "check" for r_ in rows)
+    n_check = sum(row["qc_flag"] == "check" for row in rows)
     print(f"\nAttachments kept: {len(rows)} (expected {args.expected_count}), "
           f"flagged 'check': {n_check}")
     if args.expected_count and len(rows) != args.expected_count:

@@ -112,11 +112,11 @@ def main(args):
     thin = Side(style="thin", color="BBBBBB")
     r = 1
     for s in args.samples:
-        vols = {int(v["tooth"]): v
-                for v in read_csv(PROCESSED_DIR / s / "volumes_matched.csv")}
+        vols = {int(v["id"]) + 1: v
+                for v in read_csv(PROCESSED_DIR / s / "volumes.csv")}
         if not vols:
             print(
-                f"[WARNING] sample {s}: no volumes_matched.csv -> volume columns empty")
+                f"[WARNING] sample {s}: no volumes.csv -> volume columns empty")
 
         ws.cell(r, 1, f"گروه {s.translate(FA)}: {TITLES.get(s, '')}").font = Font(
             bold=True, size=12)
@@ -132,12 +132,14 @@ def main(args):
         first = r
         for t in range(1, N_TEETH + 1):
             v, m = vols.get(t, {}), manual.get((s, t), {})
+            pre_vol = v.get("T1_aligned_volume_mm3") or v.get("T1_volume_mm3")
+            post_vol = v.get("T2_volume_mm3")
             ws.cell(r, 1, f"{s}.{t}").number_format = "@"
             ws.cell(r, 2, num(m.get("defect")))
             ws.cell(r, 3, num(m.get("excess")))
             ws.cell(r, 4, num(m.get("rms")))
-            ws.cell(r, 5, num(v.get("pre_volume_mm3")))
-            ws.cell(r, 6, num(v.get("post_volume_mm3")))
+            ws.cell(r, 5, num(pre_vol))
+            ws.cell(r, 6, num(post_vol))
             ws.cell(
                 r, 7, f'=IF(AND(ISNUMBER(E{r}),ISNUMBER(F{r})),E{r}-F{r},"")')
             ws.cell(r, 8, f'=IF(AND(ISNUMBER(G{r}),E{r}>0),G{r}/E{r},"")')

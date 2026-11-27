@@ -1,4 +1,3 @@
-# src/align.
 """
 Align T1 to T2 with robust point-to-plane ICP, starting from picked points.
 

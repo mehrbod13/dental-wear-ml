@@ -1,4 +1,3 @@
-# src/measure_volume.py
 """
 Phase 1 - Step 3a: volume of the detected attachments, for every detected scan
 (T1, T2, T1_aligned) found in data/processed/<sample>/.
